@@ -20,7 +20,7 @@ ping_interval_secs = 30
 
 [dex.edgex]
 enabled = true
-ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+ws_url = "wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws"
 reconnect_max_attempts = 10
 reconnect_base_delay_ms = 500
 reconnect_max_delay_ms = 30000
