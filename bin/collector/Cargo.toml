@@ -1,0 +1,30 @@
+[package]
+name = "collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "collector"
+path = "src/main.rs"
+
+[dependencies]
+config.workspace = true
+core-types.workspace = true
+dex-edgex.workspace = true
+dex-hyperliquid.workspace = true
+dex-traits.workspace = true
+market-data.workspace = true
+recorder.workspace = true
+
+anyhow.workspace = true
+rust_decimal.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+rust_decimal_macros.workspace = true
+serde_json.workspace = true
+tempfile = "3"

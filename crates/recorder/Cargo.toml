@@ -1,0 +1,24 @@
+[package]
+name = "recorder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+config.workspace = true
+core-types.workspace = true
+market-data.workspace = true
+
+chrono.workspace = true
+csv.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+tempfile = "3"

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+
+# 収集した実データ・ログはコミットしない
+/data/
+/logs/
+
+# OS / エディタ
+.DS_Store
+.vscode/
+.idea/

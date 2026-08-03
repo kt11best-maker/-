@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-types",
+    "crates/dex-traits",
+    "crates/dex-hyperliquid",
+    "crates/dex-edgex",
+    "crates/market-data",
+    "crates/recorder",
+    "crates/config",
+    "bin/collector",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+
+[workspace.dependencies]
+core-types = { path = "crates/core-types" }
+dex-traits = { path = "crates/dex-traits" }
+dex-hyperliquid = { path = "crates/dex-hyperliquid" }
+dex-edgex = { path = "crates/dex-edgex" }
+market-data = { path = "crates/market-data" }
+recorder = { path = "crates/recorder" }
+config = { path = "crates/config" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+csv = "1.3"
+dashmap = "6"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde", "maths"] }
+rust_decimal_macros = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+toml = "1"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

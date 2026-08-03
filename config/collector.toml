@@ -1,0 +1,60 @@
+# フェーズ1 collector 設定ファイル
+#
+# 記載しなかった項目はコード側の既定値が使われる（crates/config/src/lib.rs）。
+
+[general]
+symbols = ["BTC", "ETH", "SOL", "HYPE"]
+orderbook_depth = 20
+# VWAP ベース乖離を計算する際の想定ノーショナル（USD）。0 で無効。
+vwap_notional_usd = 1000
+book_channel_capacity = 4096
+
+[dex.hyperliquid]
+enabled = true
+ws_url = "wss://api.hyperliquid.xyz/ws"
+reconnect_max_attempts = 10
+reconnect_base_delay_ms = 500
+reconnect_max_delay_ms = 30000
+# 無通信が続くと取引所側から切断されるため必須
+ping_interval_secs = 30
+
+[dex.edgex]
+enabled = true
+ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+reconnect_max_attempts = 10
+reconnect_base_delay_ms = 500
+reconnect_max_delay_ms = 30000
+ping_interval_secs = 20
+# depth チャネルのレベル数（API 側で離散値に制限される）
+depth_level = 15
+# 差分再構築のズレ検出のため定期的に再購読してスナップショットを取り直す（秒, 0 で無効）
+resync_interval_secs = 300
+# 起動時に REST メタデータから contractId を解決する
+resolve_contract_ids = true
+metadata_url = "https://pro.edgex.exchange/api/v1/public/meta/getMetaData"
+# 自動解決に失敗した場合のフォールバック（手動指定は常に優先される）。
+# 実際の contractId を確認して埋めること。
+# [dex.edgex.contract_ids]
+# BTC = "10000001"
+# ETH = "10000002"
+# SOL = "10000003"
+# HYPE = "10000004"
+
+[recording]
+csv_dir = "data"
+log_dir = "logs"
+# all | sampled | threshold
+# フェーズ1 は全件記録で開始し、ファイルサイズを見てから調整する
+csv_mode = "all"
+csv_sample_interval_ms = 100
+csv_threshold_bps = 5
+csv_flush_interval_ms = 1000
+snapshot_channel_capacity = 8192
+log_filter = "info"
+log_to_stdout = false
+
+[monitoring]
+latency_warn_threshold_ms = 500
+staleness_warn_threshold_ms = 1000
+status_interval_secs = 60
+warn_min_interval_secs = 10
