@@ -10,6 +10,10 @@ members = [
     "crates/market-data",
     "crates/recorder",
     "crates/config",
+    "crates/strategy-traits",
+    "crates/strategy-price-arb",
+    "crates/strategy-funding-arb",
+    "crates/risk",
     "bin/collector",
 ]
 
@@ -29,6 +33,10 @@ dex-lighter = { path = "crates/dex-lighter" }
 market-data = { path = "crates/market-data" }
 recorder = { path = "crates/recorder" }
 config = { path = "crates/config" }
+strategy-traits = { path = "crates/strategy-traits" }
+strategy-price-arb = { path = "crates/strategy-price-arb" }
+strategy-funding-arb = { path = "crates/strategy-funding-arb" }
+risk = { path = "crates/risk" }
 
 anyhow = "1.0"
 async-trait = "0.1"

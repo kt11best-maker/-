@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use core_types::{Dex, Symbol};
+use core_types::{Dex, DexFees, ExecutionStyle, FeeSchedule, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,162 @@ pub struct Config {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub allocation: AllocationConfig,
+    #[serde(default)]
+    pub killswitch: KillSwitchConfig,
+    /// DEX ごとの手数料率。**既定値は持たせない。**
+    /// 未設定の DEX を含むペアは、戦略側でシグナルを出さずにスキップされる。
+    #[serde(default)]
+    pub fees: BTreeMap<Dex, DexFees>,
+}
+
+/// 指値/成行の指定（設定ファイルからの入力用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FillStyle {
+    Taker,
+    Maker,
+}
+
+impl From<FillStyle> for ExecutionStyle {
+    fn from(value: FillStyle) -> Self {
+        match value {
+            FillStyle::Taker => ExecutionStyle::Taker,
+            FillStyle::Maker => ExecutionStyle::Maker,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrategyConfig {
+    #[serde(default)]
+    pub price_arb: PriceArbConfig,
+    #[serde(default)]
+    pub funding_arb: FundingArbConfig,
+}
+
+/// 価格差アービトラージの判定パラメータ。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceArbConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// この純利益（bps）を下回るシグナルは出さない。
+    #[serde(default = "default_price_arb_min_profit_bps")]
+    pub min_profit_bps: Decimal,
+    /// 安全マージン（bps）。見せ板・競合による過大評価を吸収する。
+    #[serde(default = "default_price_arb_buffer_bps")]
+    pub safety_buffer_bps: Decimal,
+    /// 1 シグナルあたりの想定ノーショナル（USD）。
+    #[serde(default = "default_signal_notional_usd")]
+    pub notional_usd: Decimal,
+    /// 板の鮮度差がこれを超えるペアは判定しない（見かけ上の乖離を弾く）。
+    #[serde(default = "default_price_arb_max_staleness_ms")]
+    pub max_staleness_delta_ms: i64,
+    /// 想定サイズの VWAP ベースで判定するか。true ならスリッページは
+    /// 乖離に織り込み済みとして扱う。false なら best 気配ベース + 明示的な
+    /// スリッページ見積もりを使う。
+    #[serde(default = "default_true")]
+    pub use_vwap: bool,
+    /// `use_vwap = false` のときに差し引くスリッページ見積もり（bps）。
+    #[serde(default = "default_price_arb_slippage_bps")]
+    pub assumed_slippage_bps: Decimal,
+    /// 決済側の手数料も差し引くか（建て+決済＝4 レグ）。
+    ///
+    /// 既定 true。乖離を捉えて建てたポジションはいずれ決済するため、
+    /// 建てだけの 2 レグで判定すると手数料を過小評価する。
+    #[serde(default = "default_true")]
+    pub count_exit_fees: bool,
+    #[serde(default = "default_taker")]
+    pub entry_style: FillStyle,
+    #[serde(default = "default_taker")]
+    pub exit_style: FillStyle,
+}
+
+/// ファンディング裁定の判定パラメータ。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingArbConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// これ未満のレート差（bps/精算）はシグナルを出さない。
+    #[serde(default = "default_funding_min_rate_diff_bps")]
+    pub min_rate_diff_bps: Decimal,
+    /// 1 精算あたりの純収益がこれを下回るシグナルは出さない（bps）。
+    #[serde(default = "default_funding_min_profit_bps")]
+    pub min_profit_bps: Decimal,
+    #[serde(default = "default_funding_buffer_bps")]
+    pub safety_buffer_bps: Decimal,
+    /// 想定保有精算回数。期待収益の換算に使う。
+    #[serde(default = "default_funding_expected_intervals")]
+    pub expected_intervals: u32,
+    /// 手数料回収に必要な精算回数がこれを超えるシグナルは棄却する。
+    #[serde(default = "default_funding_max_breakeven_intervals")]
+    pub max_acceptable_breakeven_intervals: u32,
+    /// これ以上不利なベーシスでは建てない（bps）。
+    #[serde(default = "default_funding_max_adverse_basis_bps")]
+    pub max_adverse_basis_bps: Decimal,
+    /// 有利なベーシスを期待収益に加算するか。**既定 false（保守的）。**
+    /// 価格差の収束を当てにすると、収束しなかった場合に想定が崩れる。
+    #[serde(default)]
+    pub count_favorable_basis: bool,
+    /// 1 ポジションあたり、funding_arb 枠に対する比率。
+    #[serde(default = "default_funding_per_position_max_pct")]
+    pub per_position_max_pct: Decimal,
+    /// 同時保有ポジション数の上限。
+    #[serde(default = "default_funding_max_positions")]
+    pub max_concurrent_positions: u32,
+    /// 最大保有時間。超えたら解消する。
+    #[serde(default = "default_funding_max_holding_hours")]
+    pub max_holding_hours: Decimal,
+    /// 1 シグナルあたりの想定ノーショナル（USD）。
+    #[serde(default = "default_signal_notional_usd")]
+    pub notional_usd: Decimal,
+    /// 精算間隔が異なる DEX 同士のペアを許可するか。
+    /// 既定 false（1 精算あたりの比較が成立しないため）。
+    #[serde(default)]
+    pub allow_mismatched_intervals: bool,
+    /// 建ては指値でよい（`Urgency::Patient`）。
+    #[serde(default = "default_maker")]
+    pub entry_style: FillStyle,
+    /// 決済は約定を優先するのでテイカー想定。
+    #[serde(default = "default_taker")]
+    pub exit_style: FillStyle,
+}
+
+/// 戦略ごとの証拠金枠。
+///
+/// 2 戦略が同じ証拠金プールを取り合うと、ファンディング裁定の長期ポジションが
+/// 価格差アービトラージの機会を潰す（またはその逆）。枠を分離する。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllocationConfig {
+    #[serde(default = "default_price_arb_pct")]
+    pub price_arb_pct: Decimal,
+    #[serde(default = "default_funding_arb_pct")]
+    pub funding_arb_pct: Decimal,
+    /// **どちらの戦略も使えない**緊急クローズ専用の余力。
+    #[serde(default = "default_reserve_pct")]
+    pub reserve_pct: Decimal,
+}
+
+/// 多層キルスイッチの閾値。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KillSwitchConfig {
+    /// 価格差アービトラージだけを止める日次損失上限（%）。
+    #[serde(default = "default_strategy_loss_limit_pct")]
+    pub price_arb_daily_loss_limit_pct: Decimal,
+    /// ファンディング裁定だけを止める日次損失上限（%）。
+    #[serde(default = "default_strategy_loss_limit_pct")]
+    pub funding_arb_daily_loss_limit_pct: Decimal,
+    /// Bot 全体（両戦略を停止）の日次損失上限（%）。
+    #[serde(default = "default_global_loss_limit_pct")]
+    pub global_daily_loss_limit_pct: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -330,6 +486,26 @@ impl Config {
                     .into(),
             ));
         }
+        self.validate_allocation()?;
+        if self.strategy.funding_arb.enabled
+            && self.strategy.funding_arb.max_holding_hours <= Decimal::ZERO
+        {
+            return Err(ConfigError::Invalid(
+                "strategy.funding_arb.max_holding_hours は 0 より大きくしてください".into(),
+            ));
+        }
+        if self.strategy.funding_arb.enabled && self.strategy.funding_arb.expected_intervals == 0 {
+            return Err(ConfigError::Invalid(
+                "strategy.funding_arb.expected_intervals は 1 以上".into(),
+            ));
+        }
+        if self.strategy.funding_arb.enabled
+            && self.strategy.funding_arb.max_concurrent_positions == 0
+        {
+            return Err(ConfigError::Invalid(
+                "strategy.funding_arb.max_concurrent_positions は 1 以上".into(),
+            ));
+        }
         for (dex, symbols) in Dex::ALL
             .iter()
             .filter(|d| self.is_enabled(**d))
@@ -342,6 +518,39 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// 証拠金枠の配分を検証する。
+    fn validate_allocation(&self) -> Result<(), ConfigError> {
+        let a = &self.allocation;
+        for (name, value) in [
+            ("price_arb_pct", a.price_arb_pct),
+            ("funding_arb_pct", a.funding_arb_pct),
+            ("reserve_pct", a.reserve_pct),
+        ] {
+            if value < Decimal::ZERO {
+                return Err(ConfigError::Invalid(format!(
+                    "allocation.{name} は 0 以上にしてください"
+                )));
+            }
+        }
+        let total = a.price_arb_pct + a.funding_arb_pct + a.reserve_pct;
+        if total > Decimal::ONE {
+            return Err(ConfigError::Invalid(format!(
+                "allocation の合計が 1.0 を超えています: {total}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 手数料表を組み立てる。未設定の DEX は含まれない。
+    pub fn fee_schedule(&self) -> FeeSchedule {
+        FeeSchedule::from_map(self.fees.clone())
+    }
+
+    /// 手数料が未設定の（= 有効だが判定に使えない）DEX。
+    pub fn dexes_missing_fees(&self) -> Vec<Dex> {
+        self.fee_schedule().missing(&self.enabled_dexes())
     }
 
     /// VWAP 乖離の計算に使うノーショナル。0 以下なら計算しない。
@@ -546,6 +755,69 @@ fn default_lighter_keepalive_secs() -> u64 {
 fn default_lighter_mapping_warn_secs() -> u64 {
     30
 }
+fn default_taker() -> FillStyle {
+    FillStyle::Taker
+}
+fn default_maker() -> FillStyle {
+    FillStyle::Maker
+}
+fn default_signal_notional_usd() -> Decimal {
+    Decimal::from(1_000)
+}
+fn default_price_arb_min_profit_bps() -> Decimal {
+    Decimal::ONE
+}
+fn default_price_arb_buffer_bps() -> Decimal {
+    Decimal::TWO
+}
+fn default_price_arb_max_staleness_ms() -> i64 {
+    250
+}
+fn default_price_arb_slippage_bps() -> Decimal {
+    Decimal::TWO
+}
+fn default_funding_min_rate_diff_bps() -> Decimal {
+    Decimal::ONE
+}
+fn default_funding_min_profit_bps() -> Decimal {
+    Decimal::new(5, 1)
+}
+fn default_funding_buffer_bps() -> Decimal {
+    Decimal::new(5, 1)
+}
+fn default_funding_expected_intervals() -> u32 {
+    12
+}
+fn default_funding_max_breakeven_intervals() -> u32 {
+    6
+}
+fn default_funding_max_adverse_basis_bps() -> Decimal {
+    Decimal::TWO
+}
+fn default_funding_per_position_max_pct() -> Decimal {
+    Decimal::new(10, 2)
+}
+fn default_funding_max_positions() -> u32 {
+    4
+}
+fn default_funding_max_holding_hours() -> Decimal {
+    Decimal::from(72)
+}
+fn default_price_arb_pct() -> Decimal {
+    Decimal::new(30, 2)
+}
+fn default_funding_arb_pct() -> Decimal {
+    Decimal::new(40, 2)
+}
+fn default_reserve_pct() -> Decimal {
+    Decimal::new(30, 2)
+}
+fn default_strategy_loss_limit_pct() -> Decimal {
+    Decimal::TWO
+}
+fn default_global_loss_limit_pct() -> Decimal {
+    Decimal::from(3)
+}
 fn default_csv_dir() -> PathBuf {
     PathBuf::from("data")
 }
@@ -674,6 +946,65 @@ impl Default for RecordingConfig {
             snapshot_channel_capacity: default_snapshot_channel_capacity(),
             log_filter: default_log_filter(),
             log_to_stdout: false,
+        }
+    }
+}
+
+impl Default for PriceArbConfig {
+    fn default() -> Self {
+        PriceArbConfig {
+            enabled: true,
+            min_profit_bps: default_price_arb_min_profit_bps(),
+            safety_buffer_bps: default_price_arb_buffer_bps(),
+            notional_usd: default_signal_notional_usd(),
+            max_staleness_delta_ms: default_price_arb_max_staleness_ms(),
+            use_vwap: true,
+            assumed_slippage_bps: default_price_arb_slippage_bps(),
+            count_exit_fees: true,
+            entry_style: FillStyle::Taker,
+            exit_style: FillStyle::Taker,
+        }
+    }
+}
+
+impl Default for FundingArbConfig {
+    fn default() -> Self {
+        FundingArbConfig {
+            enabled: true,
+            min_rate_diff_bps: default_funding_min_rate_diff_bps(),
+            min_profit_bps: default_funding_min_profit_bps(),
+            safety_buffer_bps: default_funding_buffer_bps(),
+            expected_intervals: default_funding_expected_intervals(),
+            max_acceptable_breakeven_intervals: default_funding_max_breakeven_intervals(),
+            max_adverse_basis_bps: default_funding_max_adverse_basis_bps(),
+            count_favorable_basis: false,
+            per_position_max_pct: default_funding_per_position_max_pct(),
+            max_concurrent_positions: default_funding_max_positions(),
+            max_holding_hours: default_funding_max_holding_hours(),
+            notional_usd: default_signal_notional_usd(),
+            allow_mismatched_intervals: false,
+            entry_style: FillStyle::Maker,
+            exit_style: FillStyle::Taker,
+        }
+    }
+}
+
+impl Default for AllocationConfig {
+    fn default() -> Self {
+        AllocationConfig {
+            price_arb_pct: default_price_arb_pct(),
+            funding_arb_pct: default_funding_arb_pct(),
+            reserve_pct: default_reserve_pct(),
+        }
+    }
+}
+
+impl Default for KillSwitchConfig {
+    fn default() -> Self {
+        KillSwitchConfig {
+            price_arb_daily_loss_limit_pct: default_strategy_loss_limit_pct(),
+            funding_arb_daily_loss_limit_pct: default_strategy_loss_limit_pct(),
+            global_daily_loss_limit_pct: default_global_loss_limit_pct(),
         }
     }
 }

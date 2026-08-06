@@ -1442,6 +1442,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "risk"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "core-types",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "strategy-traits",
+ "tracing",
+]
+
+[[package]]
 name = "rkyv"
 version = "0.7.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1802,6 +1815,46 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "strategy-funding-arb"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "core-types",
+ "market-data",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "strategy-traits",
+ "tracing",
+]
+
+[[package]]
+name = "strategy-price-arb"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "core-types",
+ "market-data",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "strategy-traits",
+ "tracing",
+]
+
+[[package]]
+name = "strategy-traits"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+ "market-data",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "tracing",
+]
 
 [[package]]
 name = "subtle"

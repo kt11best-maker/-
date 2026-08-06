@@ -8,9 +8,11 @@
 //! （= その銘柄がその DEX に存在しない）ペアは正常系としてスキップされる。
 
 pub mod divergence;
+pub mod funding_store;
 pub mod pairs;
 pub mod store;
 
 pub use divergence::{DivergenceSnapshot, ExecutableDirection, DEPTH_SLIPPAGE_BPS};
+pub use funding_store::FundingStore;
 pub use pairs::{dex_pairs, pairs_involving};
 pub use store::BookStore;

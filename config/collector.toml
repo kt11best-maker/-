@@ -1,6 +1,10 @@
 # フェーズ1 collector 設定ファイル
 #
 # 記載しなかった項目はコード側の既定値が使われる（crates/config/src/lib.rs）。
+#
+# 対象 DEX は Hyperliquid + Lighter の 2 つ。ファンディング精算間隔を揃える
+# （両者とも 1 時間）ことを優先したため、edgeX / Aster は一時無効化している。
+# **コードは残してあり、テストも回り続ける。** 再開は enabled = true だけでよい。
 
 [general]
 symbols = ["BTC", "ETH", "SOL", "HYPE"]
@@ -20,7 +24,8 @@ ping_interval_secs = 30
 excluded_symbols = []
 
 [dex.edgex]
-enabled = true
+# 一時無効化。精算間隔を一次情報で確認してから再開する
+enabled = false
 ws_url = "wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws"
 reconnect_max_attempts = 10
 reconnect_base_delay_ms = 500
@@ -44,7 +49,8 @@ excluded_symbols = []
 # HYPE = "10000004"
 
 [dex.aster]
-enabled = true
+# 一時無効化。8 時間精算のため、有効化する際は年率換算での比較が必須
+enabled = false
 ws_url = "wss://fstream.asterdex.com"
 # Spot 用の sapi ではなく Futures/Perp 用の fapi を使う
 rest_url = "https://fapi.asterdex.com"
@@ -93,3 +99,80 @@ latency_warn_threshold_ms = 500
 staleness_warn_threshold_ms = 1000
 status_interval_secs = 60
 warn_min_interval_secs = 10
+
+# ---------------------------------------------------------------------------
+# 戦略（フェーズ2 で使う。フェーズ1 の collector はシグナルを出さない）
+# ---------------------------------------------------------------------------
+
+[strategy.price_arb]
+enabled = true
+# 実質乖離がこれを下回るシグナルは出さない
+min_profit_bps = 1.0
+safety_buffer_bps = 2.0
+notional_usd = 1000
+# 板の鮮度差がこれを超えるペアは判定しない（見かけ上の乖離を弾く）
+max_staleness_delta_ms = 250
+# true なら想定サイズの VWAP ベースで判定する（スリッページは織り込み済み）
+use_vwap = true
+assumed_slippage_bps = 2.0
+# 建て + 決済の 4 レグ分の手数料を引く
+count_exit_fees = true
+entry_style = "taker"
+exit_style = "taker"
+
+[strategy.funding_arb]
+enabled = true
+# 1 精算あたりのレート差がこれ未満ならシグナルを出さない
+min_rate_diff_bps = 1.0
+# 1 精算あたりの純収益の下限
+min_profit_bps = 0.5
+safety_buffer_bps = 0.5
+# 想定保有精算回数（1 時間精算なら 12 = 12 時間）
+expected_intervals = 12
+# 手数料回収に必要な精算回数がこれを超えたら棄却
+max_acceptable_breakeven_intervals = 6
+# これ以上不利なベーシス（価格差）では建てない
+max_adverse_basis_bps = 2.0
+# 有利なベーシスを期待収益に加算するか。既定 false（収束を当てにしない）
+count_favorable_basis = false
+per_position_max_pct = 0.10
+max_concurrent_positions = 4
+max_holding_hours = 72
+notional_usd = 1000
+# 精算間隔が異なる DEX 同士のペアを許可するか（Aster 有効化時に要検討）
+allow_mismatched_intervals = false
+entry_style = "maker"
+exit_style = "taker"
+
+# ---------------------------------------------------------------------------
+# 資金配分とキルスイッチ
+# ---------------------------------------------------------------------------
+
+[allocation]
+# 各 DEX の証拠金プールに対する配分比率。合計が 1.0 を超えないこと
+price_arb_pct = 0.30
+funding_arb_pct = 0.40
+# どちらの戦略も使えない緊急クローズ専用の余力
+reserve_pct = 0.30
+
+[killswitch]
+# 戦略ごとに独立して停止できる
+price_arb_daily_loss_limit_pct = 2.0
+funding_arb_daily_loss_limit_pct = 2.0
+# Bot 全体（両戦略を停止）
+global_daily_loss_limit_pct = 3.0
+
+# ---------------------------------------------------------------------------
+# 手数料率（bps）
+# ---------------------------------------------------------------------------
+# **既定値は持たせていない。** 未設定の DEX を含むペアは、戦略側でシグナルを
+# 出さずにスキップされる（確認前の値で利益判定が通らないようにするため）。
+# 一次情報で確認してからコメントを外すこと。
+#
+# [fees.hyperliquid]
+# taker_bps = 4.5
+# maker_bps = 1.5
+#
+# [fees.lighter]
+# taker_bps = 2.0
+# maker_bps = 0.0

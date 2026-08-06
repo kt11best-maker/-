@@ -7,11 +7,15 @@
 //!   ([`std::time::Instant`])」を厳密に使い分ける（[`MessageTrace`] を参照）。
 
 pub mod book;
+pub mod fees;
+pub mod funding;
 pub mod num;
 pub mod symbol;
 pub mod trace;
 
 pub use book::{Level, OrderBook, Side};
+pub use fees::{DexFees, ExecutionStyle, FeeSchedule};
+pub use funding::{breakeven_intervals, FundingRate, FundingSpread};
 pub use num::{Price, Quantity, BPS_DENOMINATOR};
 pub use symbol::{Dex, ParseSymbolError, Symbol};
 pub use trace::MessageTrace;

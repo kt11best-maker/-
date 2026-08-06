@@ -1,0 +1,16 @@
+[package]
+name = "strategy-traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types.workspace = true
+market-data.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
