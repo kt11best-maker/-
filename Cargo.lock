@@ -243,8 +243,10 @@ dependencies = [
  "chrono",
  "config",
  "core-types",
+ "dex-aster",
  "dex-edgex",
  "dex-hyperliquid",
+ "dex-lighter",
  "dex-traits",
  "market-data",
  "recorder",
@@ -390,6 +392,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
+name = "dex-aster"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "config",
+ "core-types",
+ "dex-traits",
+ "futures-util",
+ "reqwest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "dex-edgex"
 version = "0.1.0"
 dependencies = [
@@ -410,6 +431,24 @@ dependencies = [
 
 [[package]]
 name = "dex-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "config",
+ "core-types",
+ "dex-traits",
+ "futures-util",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "dex-lighter"
 version = "0.1.0"
 dependencies = [
  "async-trait",

@@ -1,16 +1,16 @@
 //! フェーズ1 の実行バイナリ。
 //!
-//! Hyperliquid と edgeX の板を購読し、価格差スナップショットを CSV に、
-//! 運用イベントを JSON ログに書き出す。**発注は一切行わない。**
+//! 有効化された DEX（Hyperliquid / edgeX / Aster / Lighter）の板を購読し、
+//! 価格差スナップショットを CSV に、運用イベントを JSON ログに書き出す。
+//! **発注は一切行わない。**
 //!
 //! ```text
 //! 起動
 //!  ├─ config 読み込み
 //!  ├─ ログ初期化（tracing → JSON file）
 //!  ├─ BookStore 初期化
-//!  ├─ spawn: Hyperliquid WS 購読タスク ─┐
-//!  ├─ spawn: edgeX WS 購読タスク       ─┼→ mpsc<OrderBook>
-//!  ├─ spawn: 集約タスク  ←─────────────┘  → mpsc<DivergenceSnapshot>
+//!  ├─ spawn: 各 DEX の WS 購読タスク（有効なものだけ）─→ mpsc<OrderBook>
+//!  ├─ spawn: 集約タスク（N(N-1)/2 ペアの価格差）      ─→ mpsc<DivergenceSnapshot>
 //!  ├─ spawn: CSV writer タスク（バッファリングして定期 flush）
 //!  ├─ spawn: 監視タスク（接続状態・レイテンシ異常）
 //!  └─ SIGINT/SIGTERM → CSV を flush して正常終了
@@ -27,15 +27,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use config::Config;
+use core_types::Dex;
+use dex_aster::AsterMarketData;
 use dex_edgex::EdgeXMarketData;
 use dex_hyperliquid::HyperliquidMarketData;
+use dex_lighter::LighterMarketData;
 use dex_traits::MarketDataSource;
 use market_data::BookStore;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::aggregator::{spawn_aggregator, AggregatorStats};
-use crate::monitor::{spawn_monitor, MonitorTargets};
+use crate::monitor::spawn_monitor;
 use crate::supervisor::spawn_supervised_source;
 
 const DEFAULT_CONFIG_PATH: &str = "config/collector.toml";
@@ -67,35 +70,24 @@ async fn main() -> Result<()> {
     let (snapshot_tx, snapshot_rx) = mpsc::channel(cfg.recording.snapshot_channel_capacity);
 
     // --- Market Data タスク ---
-    let mut targets = MonitorTargets::default();
+    let sources = build_sources(&cfg)?;
     let mut source_handles = Vec::new();
 
-    if cfg.dex.hyperliquid.enabled {
-        let source = Arc::new(HyperliquidMarketData::new(cfg.dex.hyperliquid.clone()));
-        targets.hyperliquid = Some(Arc::clone(&source));
+    for source in &sources {
+        let dex = source.dex();
+        let symbols = cfg.symbols_for(dex);
+        info!(
+            dex = %dex,
+            symbols = ?symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "Market Data タスクを起動"
+        );
         source_handles.push(spawn_supervised_source(
-            source as Arc<dyn MarketDataSource>,
-            cfg.general.symbols.clone(),
+            Arc::clone(source),
+            symbols,
             cfg.general.orderbook_depth,
             book_tx.clone(),
             shutdown_rx.clone(),
         ));
-    } else {
-        warn!(dex = "hyperliquid", "設定で無効化されています");
-    }
-
-    if cfg.dex.edgex.enabled {
-        let source = Arc::new(EdgeXMarketData::new(cfg.dex.edgex.clone()));
-        targets.edgex = Some(Arc::clone(&source));
-        source_handles.push(spawn_supervised_source(
-            source as Arc<dyn MarketDataSource>,
-            cfg.general.symbols.clone(),
-            cfg.general.orderbook_depth,
-            book_tx.clone(),
-            shutdown_rx.clone(),
-        ));
-    } else {
-        warn!(dex = "edgex", "設定で無効化されています");
     }
 
     // 送信側の原本は落としておく。全 source タスクが終われば集約タスクも終わる。
@@ -113,7 +105,7 @@ async fn main() -> Result<()> {
     );
     let monitor_handle = spawn_monitor(
         cfg.monitoring.status_interval_secs,
-        targets,
+        sources.clone(),
         Arc::clone(&stats),
         shutdown_rx.clone(),
     );
@@ -143,6 +135,40 @@ async fn main() -> Result<()> {
 
     info!("collector 終了");
     Ok(())
+}
+
+/// 設定で有効化された DEX の Market Data ソースを構築する。
+///
+/// DEX を追加する場合はここに 1 分岐足すだけでよい（以降のパイプラインは
+/// [`MarketDataSource`] の trait 越しに扱うため変更不要）。
+fn build_sources(cfg: &Config) -> Result<Vec<Arc<dyn MarketDataSource>>> {
+    let mut sources: Vec<Arc<dyn MarketDataSource>> = Vec::new();
+
+    if cfg.dex.hyperliquid.enabled {
+        sources.push(Arc::new(HyperliquidMarketData::new(
+            cfg.dex.hyperliquid.clone(),
+        )));
+    }
+    if cfg.dex.edgex.enabled {
+        sources.push(Arc::new(EdgeXMarketData::new(cfg.dex.edgex.clone())));
+    }
+    if cfg.dex.aster.enabled {
+        sources.push(Arc::new(
+            AsterMarketData::new(cfg.dex.aster.clone())
+                .context("Aster クライアントの初期化に失敗")?,
+        ));
+    }
+    if cfg.dex.lighter.enabled {
+        sources.push(Arc::new(LighterMarketData::new(cfg.dex.lighter.clone())));
+    }
+
+    for dex in Dex::ALL {
+        if !cfg.is_enabled(dex) {
+            warn!(dex = %dex, "設定で無効化されています");
+        }
+    }
+
+    Ok(sources)
 }
 
 /// `--config <path>` を読む。指定が無ければ既定パス。

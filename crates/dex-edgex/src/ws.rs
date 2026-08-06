@@ -6,7 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use config::EdgeXConfig;
 use core_types::{now_wall_ms, Dex, MessageTrace, OrderBook, Symbol};
-use dex_traits::{Backoff, ConnectionState, ConnectionStatus, MarketDataError, MarketDataSource};
+use dex_traits::{
+    Backoff, ConnectionState, ConnectionStatus, MarketDataError, MarketDataSource, SourceMetrics,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -438,6 +440,17 @@ impl MarketDataSource for EdgeXMarketData {
 
     fn connection_status(&self) -> ConnectionStatus {
         self.state.get()
+    }
+
+    fn metrics(&self) -> SourceMetrics {
+        SourceMetrics {
+            messages_received: self.messages_received(),
+            books_emitted: self.books_emitted(),
+            parse_errors: self.parse_errors(),
+            sequence_gaps: self.sequence_gaps(),
+            // 欠損検知時の再購読は sequence_gaps と 1:1 なので別途数えていない。
+            resyncs: 0,
+        }
     }
 }
 

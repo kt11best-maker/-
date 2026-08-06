@@ -1,30 +1,26 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dex_edgex::EdgeXMarketData;
-use dex_hyperliquid::HyperliquidMarketData;
-use dex_traits::{ConnectionStatus, MarketDataSource};
+use core_types::Dex;
+use dex_traits::MarketDataSource;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::aggregator::AggregatorStats;
 
-/// 監視対象のハンドル。
-#[derive(Clone, Default)]
-pub struct MonitorTargets {
-    pub hyperliquid: Option<Arc<HyperliquidMarketData>>,
-    pub edgex: Option<Arc<EdgeXMarketData>>,
-}
-
 /// 接続状態とスループットを定期出力する監視タスク。
 ///
 /// 24 時間稼働の健全性（受信が止まっていないか、再接続を繰り返していないか、
 /// 板を捨てていないか）をログだけで追えるようにするのが目的。
+///
+/// DEX 固有の型には依存せず [`MarketDataSource`] の trait 越しに扱うため、
+/// DEX を追加してもこのタスクは変更不要。
 pub fn spawn_monitor(
     interval_secs: u64,
-    targets: MonitorTargets,
+    sources: Vec<Arc<dyn MarketDataSource>>,
     stats: Arc<AggregatorStats>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -34,8 +30,7 @@ pub fn spawn_monitor(
         ticker.tick().await;
 
         // 前回時点の受信数。差分を取って「止まっていないか」を見る。
-        let mut prev_hl_messages = 0u64;
-        let mut prev_edgex_messages = 0u64;
+        let mut previous: HashMap<Dex, u64> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -45,33 +40,35 @@ pub fn spawn_monitor(
                     }
                 }
                 _ = ticker.tick() => {
-                    if let Some(hl) = targets.hyperliquid.as_ref() {
-                        let received = hl.messages_received();
-                        report_dex(
-                            "hyperliquid",
-                            hl.connection_status(),
-                            received,
-                            received.saturating_sub(prev_hl_messages),
-                            hl.books_emitted(),
-                            hl.parse_errors(),
-                            None,
-                            interval_secs,
+                    for source in &sources {
+                        let dex = source.dex();
+                        let status = source.connection_status();
+                        let metrics = source.metrics();
+                        let previous_total = previous.insert(dex, metrics.messages_received).unwrap_or(0);
+                        let delta = metrics.messages_received.saturating_sub(previous_total);
+
+                        info!(
+                            dex = %dex,
+                            status = %status,
+                            messages_total = metrics.messages_received,
+                            messages_delta = delta,
+                            books_emitted = metrics.books_emitted,
+                            parse_errors = metrics.parse_errors,
+                            sequence_gaps = metrics.sequence_gaps,
+                            resyncs = metrics.resyncs,
+                            "接続状態"
                         );
-                        prev_hl_messages = received;
-                    }
-                    if let Some(edgex) = targets.edgex.as_ref() {
-                        let received = edgex.messages_received();
-                        report_dex(
-                            "edgex",
-                            edgex.connection_status(),
-                            received,
-                            received.saturating_sub(prev_edgex_messages),
-                            edgex.books_emitted(),
-                            edgex.parse_errors(),
-                            Some(edgex.sequence_gaps()),
-                            interval_secs,
-                        );
-                        prev_edgex_messages = received;
+
+                        if !status.is_connected() {
+                            warn!(dex = %dex, status = %status, "DEX に接続できていません");
+                        } else if delta == 0 {
+                            // 接続は生きているのにデータが来ていない = 購読が通っていない可能性。
+                            warn!(
+                                dex = %dex,
+                                interval_secs,
+                                "接続中だが直近の受信が 0 件（購読状態を確認してください）"
+                            );
+                        }
                     }
 
                     info!(
@@ -88,37 +85,4 @@ pub fn spawn_monitor(
         }
         info!("監視タスク終了");
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn report_dex(
-    dex: &str,
-    status: ConnectionStatus,
-    messages_total: u64,
-    messages_delta: u64,
-    books_emitted: u64,
-    parse_errors: u64,
-    sequence_gaps: Option<u64>,
-    interval_secs: u64,
-) {
-    info!(
-        dex,
-        status = %status,
-        messages_total,
-        messages_delta,
-        books_emitted,
-        parse_errors,
-        sequence_gaps,
-        "接続状態"
-    );
-
-    if !status.is_connected() {
-        warn!(dex, status = %status, "DEX に接続できていません");
-    } else if messages_delta == 0 {
-        // 接続は生きているのにデータが来ていない = 購読が通っていない可能性。
-        warn!(
-            dex,
-            interval_secs, "接続中だが直近の受信が 0 件（購読状態を確認してください）"
-        );
-    }
 }

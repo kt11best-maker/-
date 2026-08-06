@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,20 @@ pub fn spawn_aggregator(
         cfg.monitoring.warn_min_interval_secs.max(1),
     ));
 
+    // 有効な DEX から比較ペアを導出しておく（N 個なら N(N-1)/2 通り）。
+    // 板の更新はどれか 1 つの DEX でしか起きないので、更新された DEX を含む
+    // ペアだけを再計算すればよい。
+    let enabled = cfg.enabled_dexes();
+    let pairs_by_trigger: HashMap<Dex, Vec<(Dex, Dex)>> = enabled
+        .iter()
+        .map(|dex| (*dex, market_data::pairs_involving(*dex, &enabled)))
+        .collect();
+    info!(
+        dexes = ?enabled.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+        pair_count = market_data::dex_pairs(&enabled).len(),
+        "価格差の比較ペアを構成しました"
+    );
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -60,31 +75,30 @@ pub fn spawn_aggregator(
                     store.update(book);
                     stats.books_processed.fetch_add(1, Ordering::Relaxed);
 
-                    // 比較の向きは常に (A=Hyperliquid, B=edgeX) に固定する。
+                    // 各ペアの向き (dex_a, dex_b) は Dex の宣言順に正規化済み。
                     // CSV の符号の意味が行ごとに変わらないようにするため。
-                    let Some(snapshot) = store.divergence(
-                        symbol,
-                        Dex::Hyperliquid,
-                        Dex::EdgeX,
-                        trigger,
-                        vwap_notional,
-                    ) else {
+                    // 板が揃っていないペア（その銘柄がその DEX に無い等）は
+                    // 正常系としてスキップされる。
+                    let Some(pairs) = pairs_by_trigger.get(&trigger) else {
                         continue;
                     };
-                    stats.snapshots_computed.fetch_add(1, Ordering::Relaxed);
+                    for snapshot in store.divergences(symbol, pairs, trigger, vwap_notional) {
+                        stats.snapshots_computed.fetch_add(1, Ordering::Relaxed);
 
-                    check_staleness(&snapshot, staleness_warn_ms, &mut limiter, &stats);
+                        check_staleness(&snapshot, staleness_warn_ms, &mut limiter, &stats);
 
-                    // ディスク I/O の詰まりが受信側に伝播しないよう、ここはノンブロッキング。
-                    // 捨てた件数は必ず記録し、欠測を後から把握できるようにする。
-                    if snapshot_tx.try_send(snapshot).is_err() {
-                        let dropped = stats.snapshots_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let Some(suppressed) = limiter.allow("csv_backpressure") {
-                            warn!(
-                                dropped_total = dropped,
-                                suppressed,
-                                "CSV チャネルが詰まったためスナップショットを破棄"
-                            );
+                        // ディスク I/O の詰まりが受信側に伝播しないよう、ここはノンブロッキング。
+                        // 捨てた件数は必ず記録し、欠測を後から把握できるようにする。
+                        if snapshot_tx.try_send(snapshot).is_err() {
+                            let dropped =
+                                stats.snapshots_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if let Some(suppressed) = limiter.allow("csv_backpressure") {
+                                warn!(
+                                    dropped_total = dropped,
+                                    suppressed,
+                                    "CSV チャネルが詰まったためスナップショットを破棄"
+                                );
+                            }
                         }
                     }
                 }

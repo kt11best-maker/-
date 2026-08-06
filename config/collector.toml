@@ -17,6 +17,7 @@ reconnect_base_delay_ms = 500
 reconnect_max_delay_ms = 30000
 # 無通信が続くと取引所側から切断されるため必須
 ping_interval_secs = 30
+excluded_symbols = []
 
 [dex.edgex]
 enabled = true
@@ -32,13 +33,47 @@ resync_interval_secs = 300
 # 起動時に REST メタデータから contractId を解決する
 resolve_contract_ids = true
 metadata_url = "https://pro.edgex.exchange/api/v1/public/meta/getMetaData"
+excluded_symbols = []
 # 自動解決に失敗した場合のフォールバック（手動指定は常に優先される）。
 # 実際の contractId を確認して埋めること。
+# サブテーブルなので、この [dex.edgex] セクションの最後に置くこと。
 # [dex.edgex.contract_ids]
 # BTC = "10000001"
 # ETH = "10000002"
 # SOL = "10000003"
 # HYPE = "10000004"
+
+[dex.aster]
+enabled = true
+ws_url = "wss://fstream.asterdex.com"
+# Spot 用の sapi ではなく Futures/Perp 用の fapi を使う
+rest_url = "https://fapi.asterdex.com"
+# depth ストリームの更新間隔（空文字なら既定速度の <symbol>@depth）
+depth_stream_interval = "100ms"
+snapshot_limit = 1000
+# 24 時間の強制切断を待たずに能動的に張り直す（0 で無効）
+reconnect_before_hours = 23
+reconnect_max_attempts = 10
+reconnect_base_delay_ms = 500
+reconnect_max_delay_ms = 30000
+# 板再初期化（REST スナップショット再取得）の最小間隔。IP ban 回避のため必ず効かせる
+resync_backoff_ms = 5000
+excluded_symbols = []
+
+[dex.lighter]
+enabled = true
+ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
+testnet_ws_url = "wss://testnet.zklighter.elliot.ai/stream"
+use_testnet = false
+# フェーズ1 では REST を使わない（板・シンボルマッピングとも WS で完結）
+# クライアント側が 2 分に 1 回以上フレームを送る責任があるため余裕を持たせる
+keepalive_interval_secs = 60
+reconnect_max_attempts = 10
+reconnect_base_delay_ms = 500
+reconnect_max_delay_ms = 30000
+# market_stats から market_index を解決できないまま経過したら警告する
+mapping_warn_secs = 30
+excluded_symbols = []
 
 [recording]
 csv_dir = "data"

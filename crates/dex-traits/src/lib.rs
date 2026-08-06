@@ -1,12 +1,14 @@
 //! DEX 共通インターフェース。
 //!
-//! 将来 dYdX を追加する際は、この trait を実装した crate を 1 つ足すだけで
+//! DEX を追加する際は、この trait を実装した crate を 1 つ足すだけで
 //! 上位レイヤー（collector / market-data）に変更が波及しない設計にしている。
 
 pub mod backoff;
+pub mod metrics;
 pub mod status;
 
 pub use backoff::Backoff;
+pub use metrics::{SourceCounters, SourceMetrics};
 pub use status::{ConnectionState, ConnectionStatus};
 
 use async_trait::async_trait;
@@ -31,6 +33,10 @@ pub trait MarketDataSource: Send + Sync {
 
     /// 接続状態（監視・将来のキルスイッチ用）。
     fn connection_status(&self) -> ConnectionStatus;
+
+    /// 監視タスク向けのカウンタ。DEX が増えても監視側を変更せずに済むよう、
+    /// trait 経由で一律に取得できるようにしている。
+    fn metrics(&self) -> SourceMetrics;
 }
 
 #[derive(Debug, thiserror::Error)]

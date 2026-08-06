@@ -4,20 +4,26 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// 対象 DEX。
+///
+/// 宣言順が [`Dex::ALL`] とペア列挙の正準順序になる。CSV の `dex_a`/`dex_b` は
+/// 常にこの順序で並ぶため、行ごとに符号の意味が変わらない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dex {
     Hyperliquid,
     EdgeX,
-    // 将来: Dydx
+    Aster,
+    Lighter,
 }
 
 impl Dex {
-    pub const ALL: [Dex; 2] = [Dex::Hyperliquid, Dex::EdgeX];
+    pub const ALL: [Dex; 4] = [Dex::Hyperliquid, Dex::EdgeX, Dex::Aster, Dex::Lighter];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Dex::Hyperliquid => "hyperliquid",
             Dex::EdgeX => "edgex",
+            Dex::Aster => "aster",
+            Dex::Lighter => "lighter",
         }
     }
 }
@@ -35,6 +41,8 @@ impl FromStr for Dex {
         match s.to_ascii_lowercase().as_str() {
             "hyperliquid" | "hl" => Ok(Dex::Hyperliquid),
             "edgex" => Ok(Dex::EdgeX),
+            "aster" => Ok(Dex::Aster),
+            "lighter" => Ok(Dex::Lighter),
             _ => Err(ParseSymbolError(s.to_string())),
         }
     }
@@ -70,15 +78,34 @@ impl Symbol {
     /// - Hyperliquid: `l2Book` の `coin` フィールドに渡すコイン名（`"BTC"` 等）。
     /// - edgeX: 契約名（`"BTCUSD"` 等）。実際の購読には契約名から解決した
     ///   contractId を使うため、この文字列はメタデータ照合用のキーになる。
+    /// - Aster: 取引ペア名（`"BTCUSDT"` 等）。WS のストリーム名では小文字にする
+    ///   （`Symbol::to_stream_symbol` を使うこと）。
+    /// - Lighter: ベースシンボル（`"BTC"` 等）。Lighter は銘柄を**数値の
+    ///   market_index** で識別するため、この文字列は `market_stats` の `symbol`
+    ///   と照合して market_index を動的に引くためのキーにしか使わない。
     pub fn to_dex_symbol(&self, dex: Dex) -> &'static str {
         match dex {
-            Dex::Hyperliquid => self.as_str(),
+            Dex::Hyperliquid | Dex::Lighter => self.as_str(),
             Dex::EdgeX => match self {
                 Symbol::Btc => "BTCUSD",
                 Symbol::Eth => "ETHUSD",
                 Symbol::Sol => "SOLUSD",
                 Symbol::Hype => "HYPEUSD",
             },
+            Dex::Aster => match self {
+                Symbol::Btc => "BTCUSDT",
+                Symbol::Eth => "ETHUSDT",
+                Symbol::Sol => "SOLUSDT",
+                Symbol::Hype => "HYPEUSDT",
+            },
+        }
+    }
+
+    /// WS ストリーム名に使う表記（Aster は全て小文字）。
+    pub fn to_stream_symbol(&self, dex: Dex) -> String {
+        match dex {
+            Dex::Aster => self.to_dex_symbol(dex).to_ascii_lowercase(),
+            other => self.to_dex_symbol(other).to_string(),
         }
     }
 
@@ -171,6 +198,42 @@ mod tests {
         assert_eq!(Symbol::from_dex_symbol(Dex::Hyperliquid, "DOGE"), None);
         // Hyperliquid 表記を edgeX の表として引いても一致しない
         assert_eq!(Symbol::from_dex_symbol(Dex::EdgeX, "BTC"), None);
+        assert_eq!(Symbol::from_dex_symbol(Dex::Aster, "BTCUSD"), None);
+    }
+
+    #[test]
+    fn aster_and_lighter_mappings() {
+        assert_eq!(Symbol::Btc.to_dex_symbol(Dex::Aster), "BTCUSDT");
+        assert_eq!(Symbol::Hype.to_dex_symbol(Dex::Aster), "HYPEUSDT");
+        // Lighter はベースシンボル（market_stats の symbol と照合するためのキー）
+        assert_eq!(Symbol::Btc.to_dex_symbol(Dex::Lighter), "BTC");
+        assert_eq!(Symbol::Hype.to_dex_symbol(Dex::Lighter), "HYPE");
+
+        // ストリーム名は Aster のみ小文字
+        assert_eq!(Symbol::Btc.to_stream_symbol(Dex::Aster), "btcusdt");
+        assert_eq!(Symbol::Btc.to_stream_symbol(Dex::Lighter), "BTC");
+
+        // 小文字のストリーム表記からも復元できる
+        assert_eq!(
+            Symbol::from_dex_symbol(Dex::Aster, "btcusdt"),
+            Some(Symbol::Btc)
+        );
+    }
+
+    #[test]
+    fn dex_ordering_is_canonical() {
+        // ペア列挙・CSV の dex_a/dex_b の順序はこの並びに依存する
+        assert!(Dex::Hyperliquid < Dex::EdgeX);
+        assert!(Dex::EdgeX < Dex::Aster);
+        assert!(Dex::Aster < Dex::Lighter);
+        assert_eq!(Dex::ALL.len(), 4);
+    }
+
+    #[test]
+    fn dex_parses_from_string() {
+        assert_eq!("aster".parse::<Dex>().unwrap(), Dex::Aster);
+        assert_eq!("Lighter".parse::<Dex>().unwrap(), Dex::Lighter);
+        assert!("dydx".parse::<Dex>().is_err());
     }
 
     #[test]

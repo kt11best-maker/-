@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use config::HyperliquidConfig;
 use core_types::{Dex, MessageTrace, OrderBook, Symbol};
-use dex_traits::{Backoff, ConnectionState, ConnectionStatus, MarketDataError, MarketDataSource};
+use dex_traits::{
+    Backoff, ConnectionState, ConnectionStatus, MarketDataError, MarketDataSource, SourceMetrics,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -228,5 +230,17 @@ impl MarketDataSource for HyperliquidMarketData {
 
     fn connection_status(&self) -> ConnectionStatus {
         self.state.get()
+    }
+
+    fn metrics(&self) -> SourceMetrics {
+        SourceMetrics {
+            messages_received: self.messages_received(),
+            books_emitted: self.books_emitted(),
+            parse_errors: self.parse_errors(),
+            // l2Book は毎回フルスナップショットなので、シーケンス欠損も
+            // 板の作り直しも概念として存在しない。
+            sequence_gaps: 0,
+            resyncs: 0,
+        }
     }
 }
