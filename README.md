@@ -197,7 +197,7 @@ Aster だけは構造的に REST が外せない。差分方式のため基準�
 
 ### edgeX
 
-- `wss://quote.edgex.exchange/api/v1/public/ws` に
+- `wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws` に
   `{"type":"subscribe","channel":"depth.<contractId>.<level>"}`
 - **差分更新（`dataType: "Changed"`）**が届くため、ローカルで板を再構築する。
   数量 0 は削除。`startVersion` / `endVersion` の連続性で欠損を検知し、

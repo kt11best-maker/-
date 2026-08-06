@@ -489,7 +489,7 @@ fn default_hl_ws_url() -> String {
     "wss://api.hyperliquid.xyz/ws".to_string()
 }
 fn default_edgex_ws_url() -> String {
-    "wss://quote.edgex.exchange/api/v1/public/ws".to_string()
+    "wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws".to_string()
 }
 fn default_edgex_metadata_url() -> String {
     "https://pro.edgex.exchange/api/v1/public/meta/getMetaData".to_string()
@@ -713,7 +713,7 @@ reconnect_base_delay_ms = 500
 
 [dex.edgex]
 enabled = true
-ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+ws_url = "wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws"
 reconnect_max_attempts = 10
 reconnect_base_delay_ms = 500
 contract_ids = { BTC = "10000001" }
