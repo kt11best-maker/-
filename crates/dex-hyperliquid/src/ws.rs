@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use config::HyperliquidConfig;
-use core_types::{Dex, MessageTrace, OrderBook, Symbol};
+use core_types::{Dex, FundingRate, MessageTrace, OrderBook, Symbol};
 use dex_traits::{
-    Backoff, ConnectionState, ConnectionStatus, MarketDataError, MarketDataSource, SourceMetrics,
+    Backoff, ConnectionState, ConnectionStatus, FundingChannel, FundingRateSource, MarketDataError,
+    MarketDataSource, SourceMetrics,
 };
 use futures_util::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-use crate::message::{ping_message, to_order_book, HlMessage, SubscribeRequest};
+use crate::message::{ping_message, to_funding_rate, to_order_book, HlMessage, SubscribeRequest};
 
 /// Hyperliquid の板ストリーム。
 ///
@@ -25,6 +27,13 @@ pub struct HyperliquidMarketData {
     messages_received: Arc<AtomicU64>,
     books_emitted: Arc<AtomicU64>,
     parse_errors: Arc<AtomicU64>,
+    /// ファンディングレートの送信先。`activeAssetCtx` は板と**同じ接続**に
+    /// 相乗りさせるため、接続は増えない。
+    funding: Arc<FundingChannel>,
+    /// `activeAssetCtx` を購読するか。
+    collect_funding: bool,
+    /// API が精算間隔を返さないためのフォールバック定数（時間）。
+    funding_interval_hours: Option<Decimal>,
 }
 
 impl HyperliquidMarketData {
@@ -35,7 +44,25 @@ impl HyperliquidMarketData {
             messages_received: Arc::new(AtomicU64::new(0)),
             books_emitted: Arc::new(AtomicU64::new(0)),
             parse_errors: Arc::new(AtomicU64::new(0)),
+            funding: Arc::new(FundingChannel::new()),
+            collect_funding: false,
+            funding_interval_hours: None,
         }
+    }
+
+    /// ファンディング収集の有効化と、精算間隔のフォールバック定数
+    /// （`[funding.intervals_hours]`）を設定する。
+    ///
+    /// 無効なら `activeAssetCtx` を購読しないので、板だけを取る従来どおりの
+    /// トラフィックになる。
+    pub fn with_funding(mut self, enabled: bool, interval_hours: Option<Decimal>) -> Self {
+        self.collect_funding = enabled;
+        self.funding_interval_hours = interval_hours;
+        self
+    }
+
+    pub fn funding_channel(&self) -> &FundingChannel {
+        &self.funding
     }
 
     pub fn messages_received(&self) -> u64 {
@@ -76,6 +103,24 @@ impl HyperliquidMarketData {
                 .await
                 .map_err(|e| MarketDataError::Subscribe(e.to_string()))?;
             debug!(dex = %Dex::Hyperliquid, symbol = %symbol, "l2Book を購読");
+
+            // ファンディングは同じ接続に相乗りさせる（接続を増やさない）。
+            // 失敗しても板の収集は続けたいので、ここでは購読エラーを致命にしない。
+            if self.collect_funding {
+                let req = serde_json::to_string(&SubscribeRequest::active_asset_ctx(*symbol))
+                    .map_err(|e| MarketDataError::Subscribe(e.to_string()))?;
+                match write.send(Message::text(req)).await {
+                    Ok(()) => {
+                        debug!(dex = %Dex::Hyperliquid, symbol = %symbol, "activeAssetCtx を購読")
+                    }
+                    Err(e) => warn!(
+                        dex = %Dex::Hyperliquid,
+                        symbol = %symbol,
+                        error = %e,
+                        "activeAssetCtx の購読に失敗（板の収集は継続します）"
+                    ),
+                }
+            }
         }
 
         let mut ping_ticker =
@@ -160,6 +205,19 @@ impl HyperliquidMarketData {
                     debug!(dex = %Dex::Hyperliquid, error = %e, "板の正規化をスキップ");
                 }
             },
+            HlMessage::ActiveAssetCtx { data } => {
+                // ファンディングのパース失敗は板の処理に影響させない
+                match to_funding_rate(&data, self.funding_interval_hours, trace) {
+                    Some(rate) => {
+                        self.funding.publish(rate);
+                    }
+                    None => debug!(
+                        dex = %Dex::Hyperliquid,
+                        coin = %data.coin,
+                        "ファンディングを含まない activeAssetCtx をスキップ"
+                    ),
+                }
+            }
             HlMessage::SubscriptionResponse { data } => {
                 debug!(dex = %Dex::Hyperliquid, response = %data, "購読応答");
             }
@@ -241,6 +299,33 @@ impl MarketDataSource for HyperliquidMarketData {
             // 板の作り直しも概念として存在しない。
             sequence_gaps: 0,
             resyncs: 0,
+            // クロスした板は Hyperliquid では異常データとして弾いている
+            crossed_books: 0,
         }
+    }
+}
+
+/// ファンディングは `activeAssetCtx` を板と同じ接続で購読して取る。
+///
+/// ここでやるのは送信先の登録だけで、実際のレートは板と同じセッションの
+/// 受信ループから流れる。板側が再接続すれば購読もやり直されるため、
+/// ファンディング側で再接続処理を持つ必要はない。
+#[async_trait]
+impl FundingRateSource for HyperliquidMarketData {
+    fn dex(&self) -> Dex {
+        Dex::Hyperliquid
+    }
+
+    async fn subscribe_funding(
+        &self,
+        _symbols: &[Symbol],
+        tx: mpsc::Sender<FundingRate>,
+    ) -> Result<(), MarketDataError> {
+        if !self.collect_funding {
+            return Err(MarketDataError::Config(
+                "activeAssetCtx の購読が無効です（with_funding を確認してください）".to_string(),
+            ));
+        }
+        self.funding.serve(Dex::Hyperliquid, tx).await
     }
 }

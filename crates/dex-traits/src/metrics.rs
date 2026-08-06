@@ -16,6 +16,11 @@ pub struct SourceMetrics {
     pub sequence_gaps: u64,
     /// 板の作り直し（再購読・スナップショット再取得）の回数。
     pub resyncs: u64,
+    /// bid > ask（クロスした板）を観測した回数。
+    ///
+    /// 多くの DEX ではデータ破損のサインだが、**dYdX では構造上正常に起こる**。
+    /// dYdX を実運用対象にできるかの判断材料として発生頻度を数える。
+    pub crossed_books: u64,
 }
 
 /// [`SourceMetrics`] の atomic 版。各 DEX クライアントが内部で持つ。
@@ -29,6 +34,7 @@ pub struct SourceCounters {
     parse_errors: AtomicU64,
     sequence_gaps: AtomicU64,
     resyncs: AtomicU64,
+    crossed_books: AtomicU64,
 }
 
 impl SourceCounters {
@@ -56,6 +62,14 @@ impl SourceCounters {
         self.resyncs.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_crossed_book(&self) {
+        self.crossed_books.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn crossed_books(&self) -> u64 {
+        self.crossed_books.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> SourceMetrics {
         SourceMetrics {
             messages_received: self.messages_received.load(Ordering::Relaxed),
@@ -63,6 +77,7 @@ impl SourceCounters {
             parse_errors: self.parse_errors.load(Ordering::Relaxed),
             sequence_gaps: self.sequence_gaps.load(Ordering::Relaxed),
             resyncs: self.resyncs.load(Ordering::Relaxed),
+            crossed_books: self.crossed_books.load(Ordering::Relaxed),
         }
     }
 }
@@ -82,6 +97,7 @@ mod tests {
         c.record_parse_error();
         c.record_sequence_gap();
         c.record_resync();
+        c.record_crossed_book();
 
         assert_eq!(
             c.snapshot(),
@@ -91,6 +107,7 @@ mod tests {
                 parse_errors: 1,
                 sequence_gaps: 1,
                 resyncs: 1,
+                crossed_books: 1,
             }
         );
     }

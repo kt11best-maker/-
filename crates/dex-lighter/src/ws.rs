@@ -4,12 +4,13 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use config::LighterConfig;
-use core_types::{Dex, MessageTrace, OrderBook, Symbol};
+use core_types::{Dex, FundingRate, MessageTrace, OrderBook, Price, Symbol};
 use dex_traits::{
-    Backoff, ConnectionState, ConnectionStatus, MarketDataError, MarketDataSource, SourceCounters,
-    SourceMetrics,
+    Backoff, ConnectionState, ConnectionStatus, FundingChannel, FundingRateSource, MarketDataError,
+    MarketDataSource, SourceCounters, SourceMetrics,
 };
 use futures_util::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -17,7 +18,8 @@ use tracing::{debug, error, info, warn};
 use crate::book_builder::LighterBookBuilder;
 use crate::message::{
     collect_market_stats, order_book_channel, ping_message, pong_message, subscribe_message,
-    unsubscribe_message, LighterEnvelope, LighterMessageKind, UpdateKind, MARKET_STATS_CHANNEL,
+    unsubscribe_message, LighterEnvelope, LighterMessageKind, MarketStatsEntry, UpdateKind,
+    MARKET_STATS_CHANNEL,
 };
 
 /// ローカル板が保持するレベル数の上限。
@@ -42,6 +44,14 @@ pub struct LighterMarketData {
     cfg: LighterConfig,
     state: Arc<ConnectionState>,
     counters: Arc<SourceCounters>,
+    /// ファンディングレートの送信先。板と**同じ接続**の `market_stats` から
+    /// 分岐させるので、ここは送信先スロットを持つだけで接続は増えない。
+    funding: Arc<FundingChannel>,
+    /// `market_stats` からファンディングを取り出すか。
+    collect_funding: bool,
+    /// API が精算間隔を返さないためのフォールバック定数（時間）。
+    /// 設定されていなければ `interval_hours = None` として記録する。
+    funding_interval_hours: Option<Decimal>,
 }
 
 impl LighterMarketData {
@@ -50,11 +60,29 @@ impl LighterMarketData {
             cfg,
             state: Arc::new(ConnectionState::new()),
             counters: Arc::new(SourceCounters::new()),
+            funding: Arc::new(FundingChannel::new()),
+            collect_funding: false,
+            funding_interval_hours: None,
         }
+    }
+
+    /// ファンディング収集の有効化と、精算間隔のフォールバック定数
+    /// （`[funding.intervals_hours]`）を設定する。
+    ///
+    /// Lighter はもともと `market_stats:all` を購読しているので、有効にしても
+    /// **購読も接続も増えない**（受信済みメッセージから分岐するだけ）。
+    pub fn with_funding(mut self, enabled: bool, interval_hours: Option<Decimal>) -> Self {
+        self.collect_funding = enabled;
+        self.funding_interval_hours = interval_hours;
+        self
     }
 
     pub fn counters(&self) -> &SourceCounters {
         &self.counters
+    }
+
+    pub fn funding_channel(&self) -> &FundingChannel {
+        &self.funding
     }
 
     async fn emit(
@@ -249,7 +277,7 @@ impl LighterMarketData {
                 Ok(Vec::new())
             }
             LighterMessageKind::MarketStats => {
-                Ok(self.handle_market_stats(&env, targets, mapping, builders, depth))
+                Ok(self.handle_market_stats(&env, trace, targets, mapping, builders, depth))
             }
             LighterMessageKind::OrderBook => {
                 self.handle_order_book(&env, depth, trace, builders, tx)
@@ -267,12 +295,14 @@ impl LighterMarketData {
     }
 
     /// `market_stats` から symbol → market_index を更新し、新規に解決できた
-    /// 銘柄の板を購読する。
+    /// 銘柄の板を購読する。**ファンディングレートもここで分岐させる。**
     ///
     /// `market_stats` は継続的に流れてくるため、マッピングの変化にも自動追随する。
+    #[allow(clippy::too_many_arguments)]
     fn handle_market_stats(
         &self,
         env: &LighterEnvelope,
+        trace: MessageTrace,
         targets: &HashSet<Symbol>,
         mapping: &mut HashMap<Symbol, u32>,
         builders: &mut HashMap<u32, LighterBookBuilder>,
@@ -281,15 +311,22 @@ impl LighterMarketData {
         let Some(stats) = env.market_stats.as_ref() else {
             return Vec::new();
         };
+        let exchange_ts_ms = env.exchange_ts_ms();
 
         let mut actions = Vec::new();
-        for (raw_symbol, market_index) in collect_market_stats(stats) {
-            let Some(symbol) = Symbol::from_dex_symbol(Dex::Lighter, &raw_symbol) else {
+        for entry in collect_market_stats(stats) {
+            let market_index = entry.market_id;
+            let Some(symbol) = Symbol::from_dex_symbol(Dex::Lighter, &entry.symbol) else {
                 continue;
             };
             if !targets.contains(&symbol) {
                 continue;
             }
+
+            // ファンディングはマッピングの更新有無と無関係に毎回流す
+            // （market_index が変わるのは初回だけなので、ここを先に処理する）。
+            self.publish_funding(&entry, symbol, exchange_ts_ms, trace);
+
             match mapping.get(&symbol) {
                 Some(existing) if *existing == market_index => continue,
                 Some(existing) => {
@@ -321,6 +358,47 @@ impl LighterMarketData {
             actions.push(Action::Subscribe(channel));
         }
         actions
+    }
+
+    /// `market_stats` の 1 市場分からファンディングレートを組み立てて流す。
+    ///
+    /// 送信は必ずノンブロッキング（[`FundingChannel::publish`]）。ここで待つと
+    /// 板の受信ループが止まるため、詰まっていれば捨てる。
+    fn publish_funding(
+        &self,
+        entry: &MarketStatsEntry,
+        symbol: Symbol,
+        exchange_ts_ms: Option<u64>,
+        mut trace: MessageTrace,
+    ) {
+        if !self.collect_funding || !self.funding.is_registered() {
+            return;
+        }
+        // レートが 1 つも入っていないメッセージは記録しても意味がない
+        let Some(current_rate) = entry.current_funding_rate.or(entry.funding_rate) else {
+            return;
+        };
+
+        trace.set_exchange_ts_ms(exchange_ts_ms);
+        trace.mark_normalized();
+
+        self.funding.publish(FundingRate {
+            dex: Dex::Lighter,
+            symbol,
+            current_rate,
+            // `current_funding_rate` が無いときは `funding_rate` を現在値に昇格
+            // させているので、その場合は予測値として重複させない。
+            predicted_rate: entry
+                .current_funding_rate
+                .is_some()
+                .then_some(entry.funding_rate)
+                .flatten(),
+            interval_hours: self.funding_interval_hours,
+            next_funding_time_ms: entry.next_funding_time_ms,
+            index_price: entry.index_price.map(Price),
+            mark_price: entry.mark_price.map(Price),
+            trace,
+        });
     }
 
     async fn handle_order_book(
@@ -455,5 +533,30 @@ impl MarketDataSource for LighterMarketData {
 
     fn metrics(&self) -> SourceMetrics {
         self.counters.snapshot()
+    }
+}
+
+/// ファンディングは既存の `market_stats:all` 購読から分岐させる。
+///
+/// **接続は増えない。** ここでやるのは送信先の登録だけで、実際のレートは
+/// 板と同じセッションの受信ループから流れる。板側が再接続しても登録は
+/// 維持されるため、ファンディング側で再接続処理を持つ必要もない。
+#[async_trait]
+impl FundingRateSource for LighterMarketData {
+    fn dex(&self) -> Dex {
+        Dex::Lighter
+    }
+
+    async fn subscribe_funding(
+        &self,
+        _symbols: &[Symbol],
+        tx: mpsc::Sender<FundingRate>,
+    ) -> Result<(), MarketDataError> {
+        if !self.collect_funding {
+            return Err(MarketDataError::Config(
+                "ファンディング収集が無効です（with_funding を確認してください）".to_string(),
+            ));
+        }
+        self.funding.serve(Dex::Lighter, tx).await
     }
 }

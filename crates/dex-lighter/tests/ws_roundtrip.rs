@@ -7,7 +7,7 @@ use std::time::Duration;
 use config::LighterConfig;
 use core_types::{Dex, Symbol};
 use dex_lighter::LighterMarketData;
-use dex_traits::MarketDataSource;
+use dex_traits::{FundingRateSource, MarketDataSource};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal_macros::dec;
 use tokio::net::TcpListener;
@@ -206,6 +206,84 @@ async fn unresolved_symbols_are_skipped_not_fatal() {
     assert_eq!(sub, r#"{"type":"subscribe","channel":"order_book:1"}"#);
 
     client.abort();
+}
+
+/// ファンディングは板と**同じ接続**の `market_stats` から取れること。
+///
+/// 追加の購読メッセージが増えていないことも併せて確認する（接続もストリームも
+/// 増やさないのがこの実装の要点）。
+#[tokio::test]
+async fn funding_rides_on_the_existing_market_stats_subscription() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let first = ws.next().await.unwrap().unwrap();
+        ws.send(Message::text(MARKET_STATS)).await.unwrap();
+        let second = ws.next().await.unwrap().unwrap();
+        ws.send(Message::text(SNAPSHOT)).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        vec![
+            first.to_text().unwrap().to_string(),
+            second.to_text().unwrap().to_string(),
+        ]
+    });
+
+    let source =
+        Arc::new(LighterMarketData::new(test_config(addr)).with_funding(true, Some(dec!(1))));
+    let (book_tx, mut book_rx) = mpsc::channel(16);
+    let (funding_tx, mut funding_rx) = mpsc::channel(16);
+
+    // 先にファンディングの送信先を登録してから板を購読する
+    let funding_task = {
+        let source = Arc::clone(&source);
+        tokio::spawn(async move {
+            FundingRateSource::subscribe_funding(&*source, &[Symbol::Btc], funding_tx).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = {
+        let source = Arc::clone(&source);
+        tokio::spawn(async move {
+            MarketDataSource::subscribe_orderbooks(&*source, &[Symbol::Btc], 10, book_tx).await
+        })
+    };
+
+    let rate = tokio::time::timeout(Duration::from_secs(5), funding_rx.recv())
+        .await
+        .expect("ファンディングレートを受信できなかった")
+        .unwrap();
+    assert_eq!(rate.dex, Dex::Lighter);
+    assert_eq!(rate.symbol, Symbol::Btc);
+    assert_eq!(rate.current_rate, dec!(0.0001));
+    assert_eq!(rate.index_price.unwrap().0, dec!(36000.0));
+    assert_eq!(rate.mark_price.unwrap().0, dec!(36000.1));
+    // 設定のフォールバック定数が入り、年率換算できる
+    assert_eq!(rate.interval_hours, Some(dec!(1)));
+    assert_eq!(rate.annualized_pct(), Some(dec!(87.600)));
+
+    // 板の収集も同時に動いている
+    let book = tokio::time::timeout(Duration::from_secs(5), book_rx.recv())
+        .await
+        .expect("板を受信できなかった")
+        .unwrap();
+    assert_eq!(book.symbol, Symbol::Btc);
+
+    // 送信した購読メッセージは market_stats と order_book の 2 つだけ
+    let sent = server.await.unwrap();
+    assert_eq!(
+        sent,
+        vec![
+            r#"{"type":"subscribe","channel":"market_stats:all"}"#.to_string(),
+            r#"{"type":"subscribe","channel":"order_book:1"}"#.to_string(),
+        ]
+    );
+
+    client.abort();
+    funding_task.abort();
 }
 
 #[tokio::test]

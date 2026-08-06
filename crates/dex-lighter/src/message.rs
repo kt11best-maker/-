@@ -191,17 +191,46 @@ pub fn channel_index(channel: &str) -> Option<u32> {
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
-/// `market_stats` ペイロードから `(symbol, market_id)` を拾う。
+/// `market_stats` の 1 市場分。
+///
+/// シンボルマッピング（`symbol` / `market_id`）とファンディングレートが同じ
+/// メッセージに入っているため、**板の購読に使っている接続からそのまま
+/// ファンディングも取れる**（追加の接続は不要）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MarketStatsEntry {
+    pub symbol: String,
+    pub market_id: u32,
+    pub index_price: Option<Decimal>,
+    pub mark_price: Option<Decimal>,
+    /// 現在のファンディングレート。
+    pub current_funding_rate: Option<Decimal>,
+    /// もう 1 つのレートフィールド。予測値として扱う。
+    ///
+    /// > 実装時に一次情報で意味を確認すること（予測値か直近確定値かで
+    /// > `predicted_rate` への割り当てを変える）。
+    pub funding_rate: Option<Decimal>,
+    /// 次回精算時刻（ms epoch）。API が返す場合のみ。
+    pub next_funding_time_ms: Option<u64>,
+}
+
+impl MarketStatsEntry {
+    /// ファンディング関連のフィールドが 1 つでも入っているか。
+    pub fn has_funding(&self) -> bool {
+        self.current_funding_rate.is_some() || self.funding_rate.is_some()
+    }
+}
+
+/// `market_stats` ペイロードから市場ごとの統計を拾う。
 ///
 /// 単一オブジェクト・配列・`{"0": {...}, "1": {...}}` のようなマップ、いずれの
 /// 形でも拾えるよう再帰的に探す。
-pub fn collect_market_stats(value: &serde_json::Value) -> Vec<(String, u32)> {
+pub fn collect_market_stats(value: &serde_json::Value) -> Vec<MarketStatsEntry> {
     let mut out = Vec::new();
     walk_market_stats(value, 0, &mut out);
     out
 }
 
-fn walk_market_stats(value: &serde_json::Value, depth: usize, out: &mut Vec<(String, u32)>) {
+fn walk_market_stats(value: &serde_json::Value, depth: usize, out: &mut Vec<MarketStatsEntry>) {
     if depth > 8 {
         return;
     }
@@ -210,7 +239,18 @@ fn walk_market_stats(value: &serde_json::Value, depth: usize, out: &mut Vec<(Str
             let symbol = map.get("symbol").and_then(|v| v.as_str());
             let market_id = map.get("market_id").and_then(as_u32);
             if let (Some(symbol), Some(market_id)) = (symbol, market_id) {
-                out.push((symbol.to_string(), market_id));
+                out.push(MarketStatsEntry {
+                    symbol: symbol.to_string(),
+                    market_id,
+                    index_price: map.get("index_price").and_then(as_decimal),
+                    mark_price: map.get("mark_price").and_then(as_decimal),
+                    current_funding_rate: map.get("current_funding_rate").and_then(as_decimal),
+                    funding_rate: map.get("funding_rate").and_then(as_decimal),
+                    next_funding_time_ms: map
+                        .get("next_funding_time")
+                        .or_else(|| map.get("next_funding_timestamp"))
+                        .and_then(as_u64),
+                });
             }
             for v in map.values() {
                 walk_market_stats(v, depth + 1, out);
@@ -229,6 +269,23 @@ fn as_u32(value: &serde_json::Value) -> Option<u32> {
     match value {
         serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
         serde_json::Value::String(s) => s.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+fn as_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// 価格・レートは文字列で来る。精度を落とさないよう `Decimal` で受ける。
+fn as_decimal(value: &serde_json::Value) -> Option<Decimal> {
+    match value {
+        serde_json::Value::String(s) => s.trim().parse::<Decimal>().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse::<Decimal>().ok(),
         _ => None,
     }
 }
@@ -331,7 +388,38 @@ mod tests {
         assert_eq!(env.message_kind(), LighterMessageKind::MarketStats);
 
         let stats = collect_market_stats(&env.market_stats.unwrap());
-        assert_eq!(stats, vec![("ETH".to_string(), 0)]);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].symbol, "ETH");
+        assert_eq!(stats[0].market_id, 0);
+    }
+
+    #[test]
+    fn collects_funding_fields_from_market_stats() {
+        // 板の購読と同じ接続に流れてくるメッセージからファンディングも取れる
+        let raw = r#"{"channel":"market_stats:0","market_stats":{
+            "symbol":"ETH","market_id":0,"index_price":"2000.0","mark_price":"2000.5",
+            "current_funding_rate":"0.0000125","funding_rate":"0.0000130",
+            "next_funding_time":1700000003600}}"#;
+        let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
+        let stats = collect_market_stats(&env.market_stats.unwrap());
+
+        let e = &stats[0];
+        assert!(e.has_funding());
+        assert_eq!(e.index_price, Some(dec!(2000.0)));
+        assert_eq!(e.mark_price, Some(dec!(2000.5)));
+        assert_eq!(e.current_funding_rate, Some(dec!(0.0000125)));
+        assert_eq!(e.funding_rate, Some(dec!(0.0000130)));
+        assert_eq!(e.next_funding_time_ms, Some(1700000003600));
+    }
+
+    #[test]
+    fn market_stats_without_funding_is_still_usable_for_mapping() {
+        let raw = r#"{"channel":"market_stats:all","market_stats":{
+            "0":{"symbol":"ETH","market_id":0}}}"#;
+        let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
+        let stats = collect_market_stats(&env.market_stats.unwrap());
+        assert!(!stats[0].has_funding());
+        assert_eq!(stats[0].market_id, 0);
     }
 
     #[test]
@@ -341,7 +429,10 @@ mod tests {
             "1":{"symbol":"BTC","market_id":"1"},
             "24":{"symbol":"HYPE","market_id":24}}}"#;
         let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
-        let mut stats = collect_market_stats(&env.market_stats.unwrap());
+        let mut stats: Vec<(String, u32)> = collect_market_stats(&env.market_stats.unwrap())
+            .into_iter()
+            .map(|e| (e.symbol, e.market_id))
+            .collect();
         stats.sort();
         assert_eq!(
             stats,
@@ -351,6 +442,16 @@ mod tests {
                 ("HYPE".to_string(), 24),
             ]
         );
+    }
+
+    #[test]
+    fn numeric_rates_are_read_without_precision_loss() {
+        // 数値形式で来ても Decimal として読める
+        let raw = r#"{"channel":"market_stats:0","market_stats":{
+            "symbol":"BTC","market_id":1,"current_funding_rate":0.0000125}}"#;
+        let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
+        let stats = collect_market_stats(&env.market_stats.unwrap());
+        assert_eq!(stats[0].current_funding_rate, Some(dec!(0.0000125)));
     }
 
     #[test]

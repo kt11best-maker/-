@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use core_types::FundingRate;
 use core_types::OrderBook;
 use core_types::Symbol;
-use dex_traits::{MarketDataError, MarketDataSource};
+use dex_traits::{FundingRateSource, MarketDataError, MarketDataSource};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -78,5 +79,29 @@ pub fn spawn_supervised_source(
         }
 
         info!(dex = %dex, restarts, "supervisor 終了");
+    })
+}
+
+/// ファンディング収集タスクを起動する。
+///
+/// **板の収集より優先度が低い。** ここが失敗しても板は止めないため、
+/// 板側のような再起動ループは持たず、失敗をログに残して終了する。
+/// レート自体は板と同じ WS 接続から流れてくるので、接続の復旧は板側の
+/// supervisor が面倒を見る。
+pub fn spawn_funding_source(
+    source: Arc<dyn FundingRateSource>,
+    symbols: Vec<Symbol>,
+    tx: mpsc::Sender<FundingRate>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let dex = source.dex();
+        match source.subscribe_funding(&symbols, tx).await {
+            Ok(()) => info!(dex = %dex, "ファンディング収集タスクが正常終了"),
+            Err(e) => warn!(
+                dex = %dex,
+                error = %e,
+                "ファンディング収集タスクが終了（板の収集は継続します）"
+            ),
+        }
     })
 }

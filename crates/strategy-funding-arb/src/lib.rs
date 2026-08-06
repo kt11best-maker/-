@@ -222,13 +222,16 @@ mod tests {
         )
     }
 
-    fn rate(dex: Dex, rate: Decimal, interval_hours: Decimal) -> FundingRate {
+    fn rate(dex: Dex, current_rate: Decimal, interval_hours: Decimal) -> FundingRate {
         FundingRate {
             dex,
             symbol: Symbol::Btc,
-            rate,
-            interval_hours,
+            current_rate,
+            predicted_rate: None,
+            interval_hours: Some(interval_hours),
             next_funding_time_ms: None,
+            index_price: None,
+            mark_price: None,
             trace: MessageTrace::on_receive(),
         }
     }

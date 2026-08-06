@@ -46,6 +46,8 @@ pub struct Config {
     pub allocation: AllocationConfig,
     #[serde(default)]
     pub killswitch: KillSwitchConfig,
+    #[serde(default)]
+    pub funding: FundingConfig,
     /// DEX ごとの手数料率。**既定値は持たせない。**
     /// 未設定の DEX を含むペアは、戦略側でシグナルを出さずにスキップされる。
     #[serde(default)]
@@ -196,6 +198,41 @@ pub struct KillSwitchConfig {
     /// Bot 全体（両戦略を停止）の日次損失上限（%）。
     #[serde(default = "default_global_loss_limit_pct")]
     pub global_daily_loss_limit_pct: Decimal,
+}
+
+/// ファンディングレート収集の設定。
+///
+/// 板データの収集とは独立したパイプライン。ここを無効にしても板の収集には
+/// 影響しない（逆も同様）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// ファンディング受信チャネルの容量。板より更新頻度が桁違いに低いので小さくてよい。
+    #[serde(default = "default_funding_channel_capacity")]
+    pub channel_capacity: usize,
+    /// API が精算間隔を返さない DEX のためのフォールバック定数（時間）。
+    ///
+    /// **既定値は持たせない。** 間違えると年率換算が壊れて分析が無意味になるため、
+    /// 一次情報で確認した値だけを明示的に設定する。未設定の DEX は
+    /// `interval_hours = None` として記録され、年率換算は行われず、
+    /// ファンディング裁定の判定からも（間隔不明として）外れる。
+    #[serde(default)]
+    pub intervals_hours: BTreeMap<Dex, Decimal>,
+}
+
+/// ファンディングレート CSV の記録設定。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingRecordingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 値が変化しなくても最低これだけの間隔で 1 行残す（秒）。
+    ///
+    /// データの欠損と bot の停止を区別できるようにするための心拍。
+    #[serde(default = "default_funding_heartbeat_secs")]
+    pub heartbeat_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -404,6 +441,9 @@ pub struct RecordingConfig {
     /// ログを標準出力にも出すか。
     #[serde(default)]
     pub log_to_stdout: bool,
+    /// ファンディングレート CSV の設定。
+    #[serde(default)]
+    pub funding: FundingRecordingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -486,6 +526,23 @@ impl Config {
                     .into(),
             ));
         }
+        if self.funding.enabled && self.funding.channel_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "funding.channel_capacity は 1 以上".into(),
+            ));
+        }
+        for (dex, hours) in &self.funding.intervals_hours {
+            if *hours <= Decimal::ZERO {
+                return Err(ConfigError::Invalid(format!(
+                    "funding.intervals_hours.{dex} は 0 より大きくしてください（現在: {hours}）"
+                )));
+            }
+        }
+        if self.recording.funding.enabled && self.recording.funding.heartbeat_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "recording.funding.heartbeat_interval_secs は 1 以上".into(),
+            ));
+        }
         self.validate_allocation()?;
         if self.strategy.funding_arb.enabled
             && self.strategy.funding_arb.max_holding_hours <= Decimal::ZERO
@@ -541,6 +598,22 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// その DEX のファンディング精算間隔（時間）。**未設定なら `None`。**
+    ///
+    /// `None` の場合、レートは記録されるが年率換算は行われない。推測値で
+    /// 埋めるより「不明」のまま残す方がよい（間違った年率は分析を壊す）。
+    pub fn funding_interval_hours(&self, dex: Dex) -> Option<Decimal> {
+        self.funding.intervals_hours.get(&dex).copied()
+    }
+
+    /// ファンディング精算間隔が未設定の（= 年率換算できない）有効な DEX。
+    pub fn dexes_missing_funding_interval(&self) -> Vec<Dex> {
+        self.enabled_dexes()
+            .into_iter()
+            .filter(|d| self.funding_interval_hours(*d).is_none())
+            .collect()
     }
 
     /// 手数料表を組み立てる。未設定の DEX は含まれない。
@@ -839,6 +912,12 @@ fn default_csv_flush_interval_ms() -> u64 {
 fn default_snapshot_channel_capacity() -> usize {
     8_192
 }
+fn default_funding_channel_capacity() -> usize {
+    256
+}
+fn default_funding_heartbeat_secs() -> u64 {
+    300
+}
 fn default_log_filter() -> String {
     "info".to_string()
 }
@@ -946,6 +1025,27 @@ impl Default for RecordingConfig {
             snapshot_channel_capacity: default_snapshot_channel_capacity(),
             log_filter: default_log_filter(),
             log_to_stdout: false,
+            funding: FundingRecordingConfig::default(),
+        }
+    }
+}
+
+impl Default for FundingConfig {
+    fn default() -> Self {
+        FundingConfig {
+            enabled: true,
+            channel_capacity: default_funding_channel_capacity(),
+            // 精算間隔に既定値は持たせない（一次情報で確認した値だけを使う）
+            intervals_hours: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for FundingRecordingConfig {
+    fn default() -> Self {
+        FundingRecordingConfig {
+            enabled: true,
+            heartbeat_interval_secs: default_funding_heartbeat_secs(),
         }
     }
 }
@@ -1243,6 +1343,60 @@ excluded_symbols = ["HYPE"]
     fn rejects_excluding_every_symbol() {
         let mut cfg = Config::default();
         cfg.dex.aster.excluded_symbols = Symbol::ALL.to_vec();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn funding_intervals_have_no_defaults() {
+        let cfg = Config::default();
+        // 推測値を既定で埋めない。間違った精算間隔は年率換算を壊すため。
+        assert!(cfg.funding.intervals_hours.is_empty());
+        assert_eq!(cfg.funding_interval_hours(Dex::Hyperliquid), None);
+        assert_eq!(cfg.dexes_missing_funding_interval(), cfg.enabled_dexes());
+    }
+
+    #[test]
+    fn parses_funding_section() {
+        let cfg: Config = toml::from_str(
+            r#"
+[funding]
+enabled = true
+channel_capacity = 128
+
+[funding.intervals_hours]
+hyperliquid = 1
+lighter = 1
+aster = 8
+
+[recording.funding]
+enabled = true
+heartbeat_interval_secs = 300
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(cfg.funding.channel_capacity, 128);
+        assert_eq!(
+            cfg.funding_interval_hours(Dex::Hyperliquid),
+            Some(Decimal::ONE)
+        );
+        assert_eq!(
+            cfg.funding_interval_hours(Dex::Aster),
+            Some(Decimal::from(8))
+        );
+        // 設定していない DEX は不明のまま
+        assert_eq!(cfg.funding_interval_hours(Dex::EdgeX), None);
+        assert_eq!(cfg.dexes_missing_funding_interval(), vec![Dex::EdgeX]);
+        assert_eq!(cfg.recording.funding.heartbeat_interval_secs, 300);
+    }
+
+    #[test]
+    fn rejects_non_positive_funding_interval() {
+        let mut cfg = Config::default();
+        cfg.funding
+            .intervals_hours
+            .insert(Dex::Lighter, Decimal::ZERO);
         assert!(cfg.validate().is_err());
     }
 

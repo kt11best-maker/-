@@ -4,10 +4,12 @@
 //! 上位レイヤー（collector / market-data）に変更が波及しない設計にしている。
 
 pub mod backoff;
+pub mod funding;
 pub mod metrics;
 pub mod status;
 
 pub use backoff::Backoff;
+pub use funding::{FundingChannel, FundingRateSource};
 pub use metrics::{SourceCounters, SourceMetrics};
 pub use status::{ConnectionState, ConnectionStatus};
 

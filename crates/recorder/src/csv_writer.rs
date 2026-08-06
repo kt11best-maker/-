@@ -189,10 +189,19 @@ pub enum CsvError {
 }
 
 fn open_writer(path: &Path) -> Result<csv::Writer<BufWriter<File>>, CsvError> {
+    open_writer_with_header(path, CSV_HEADER)
+}
+
+/// 追記モードでファイルを開き、新規作成時だけヘッダを書く。
+///
+/// 再起動しても同日のファイルを引き継ぐ。ファンディング CSV とも共有する。
+pub(crate) fn open_writer_with_header(
+    path: &Path,
+    header: &[&str],
+) -> Result<csv::Writer<BufWriter<File>>, CsvError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // 再起動しても同日のファイルを追記で引き継ぐ。ヘッダは新規作成時のみ書く。
     let is_new = !path.exists()
         || std::fs::metadata(path)
             .map(|m| m.len() == 0)
@@ -202,13 +211,13 @@ fn open_writer(path: &Path) -> Result<csv::Writer<BufWriter<File>>, CsvError> {
         .flexible(false)
         .from_writer(BufWriter::new(file));
     if is_new {
-        writer.write_record(CSV_HEADER)?;
+        writer.write_record(header)?;
         writer.flush()?;
     }
     Ok(writer)
 }
 
-fn wall_ms_to_date(wall_ms: u64) -> NaiveDate {
+pub(crate) fn wall_ms_to_date(wall_ms: u64) -> NaiveDate {
     DateTime::<Utc>::from_timestamp_millis(wall_ms as i64)
         .unwrap_or_else(Utc::now)
         .date_naive()
@@ -218,7 +227,7 @@ fn fmt_bps(v: Decimal) -> String {
     v.round_dp(BPS_SCALE).normalize().to_string()
 }
 
-fn fmt_opt<T: ToString>(v: Option<T>) -> String {
+pub(crate) fn fmt_opt<T: ToString>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_default()
 }
 

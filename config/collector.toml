@@ -94,6 +94,44 @@ snapshot_channel_capacity = 8192
 log_filter = "info"
 log_to_stdout = false
 
+# ファンディングレート CSV（data/{date}_{SYMBOL}_funding.csv）。
+# サブテーブルなので [recording] セクションの最後に置くこと。
+[recording.funding]
+enabled = true
+# 値が変化しなくてもこの間隔で 1 行残す（秒）。
+# データの欠損と bot の停止を区別できるようにするための心拍。
+heartbeat_interval_secs = 300
+
+# ---------------------------------------------------------------------------
+# ファンディングレート収集
+# ---------------------------------------------------------------------------
+# 板とは独立したパイプライン。ここが失敗しても板の収集は止まらない。
+#
+# 対応状況:
+#   Hyperliquid … activeAssetCtx（板と同じ接続に相乗り）
+#   Lighter     … market_stats（既に購読済みのメッセージから分岐）
+#   edgeX       … 取得方法が未確認のため未対応（板のみ）
+#   Aster       … @markPrice ストリームで取れる見込みだが、1 秒 10 メッセージ
+#                 制限の計算が必要なため未対応（板のみ）
+
+[funding]
+enabled = true
+# ファンディング受信チャネルの容量。板より更新頻度が桁違いに低いので小さくてよい
+channel_capacity = 256
+
+# API が精算間隔を返さない DEX のためのフォールバック定数（時間）。
+# **既定値は持たせていない。** 間違えると年率換算（annualized_pct）が壊れて
+# 分析が無意味になるため、一次情報で確認してからコメントを外すこと。
+# 未設定の DEX はレートだけ記録され、annualized_pct は空欄になる。
+#
+# 下記は設計書の仮置き値であり、確認済みの値ではない。
+# サブテーブルなので、この [funding] セクションの最後に置くこと。
+# [funding.intervals_hours]
+# hyperliquid = 1
+# edgex = 4
+# aster = 8
+# lighter = 1
+
 [monitoring]
 latency_warn_threshold_ms = 500
 staleness_warn_threshold_ms = 1000

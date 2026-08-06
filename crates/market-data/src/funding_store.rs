@@ -3,9 +3,12 @@
 //! 板と同じく「(DEX × 銘柄) の最新のみ」を保持する。24 時間稼働でもキー数は
 //! 固定で、レートは毎回上書きされる。
 //!
-//! > **注**: レートを WS/REST から取り込む部分（収集）はまだ実装していない。
-//! > ここは受け取ったレートを保持・比較するための器で、フェーズ1 の収集実装が
-//! > 入った時点でそこから `update` を呼ぶ。
+//! 収集は `dex-*` crate の [`FundingRateSource`] 実装が担当する（Hyperliquid の
+//! `activeAssetCtx` / Lighter の `market_stats`）。フェーズ1 では収集した
+//! レートを CSV に残すのが主目的で、この store は戦略判定
+//! （`strategy-funding-arb`）が参照する。
+//!
+//! [`FundingRateSource`]: https://docs.rs/dex-traits
 
 use core_types::{Dex, FundingRate, FundingSpread, Symbol};
 use dashmap::DashMap;
@@ -65,13 +68,16 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    fn rate(dex: Dex, symbol: Symbol, rate: Decimal) -> FundingRate {
+    fn rate(dex: Dex, symbol: Symbol, current_rate: Decimal) -> FundingRate {
         FundingRate {
             dex,
             symbol,
-            rate,
-            interval_hours: dec!(1),
+            current_rate,
+            predicted_rate: None,
+            interval_hours: Some(dec!(1)),
             next_funding_time_ms: None,
+            index_price: None,
+            mark_price: None,
             trace: MessageTrace::on_receive(),
         }
     }
@@ -83,7 +89,10 @@ mod tests {
         store.update(rate(Dex::Hyperliquid, Symbol::Btc, dec!(0.0005)));
         assert_eq!(store.len(), 1);
         assert_eq!(
-            store.get(Dex::Hyperliquid, Symbol::Btc).unwrap().rate,
+            store
+                .get(Dex::Hyperliquid, Symbol::Btc)
+                .unwrap()
+                .current_rate,
             dec!(0.0005)
         );
     }

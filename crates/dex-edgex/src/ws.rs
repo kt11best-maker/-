@@ -450,6 +450,8 @@ impl MarketDataSource for EdgeXMarketData {
             sequence_gaps: self.sequence_gaps(),
             // 欠損検知時の再購読は sequence_gaps と 1:1 なので別途数えていない。
             resyncs: 0,
+            // クロスした板は edgeX では異常データとして弾いている
+            crossed_books: 0,
         }
     }
 }
