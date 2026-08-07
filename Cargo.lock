@@ -244,6 +244,7 @@ dependencies = [
  "config",
  "core-types",
  "dex-aster",
+ "dex-dydx",
  "dex-edgex",
  "dex-hyperliquid",
  "dex-lighter",
@@ -401,6 +402,24 @@ dependencies = [
  "dex-traits",
  "futures-util",
  "reqwest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "dex-dydx"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "config",
+ "core-types",
+ "dex-traits",
+ "futures-util",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

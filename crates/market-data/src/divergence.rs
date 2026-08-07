@@ -59,6 +59,15 @@ pub struct DivergenceSnapshot {
     pub depth_a_bps10: Quantity,
     pub depth_b_bps10: Quantity,
 
+    /// 各 DEX の板がクロス（bid >= ask）していたか。
+    ///
+    /// **dYdX では構造上正常に起こる**（中央集権的なオーダーブックを持たない
+    /// ため）。クロスした板から計算した乖離は実際には取れないので、
+    /// アービトラージ機会として扱ってはいけない（[`DivergenceSnapshot::has_crossed_book`]）。
+    /// フェーズ1 では発生頻度そのものが計測対象なので、行は捨てずに残す。
+    pub book_crossed_a: bool,
+    pub book_crossed_b: bool,
+
     /// 両 DEX の板の鮮度差（A の受信時刻 - B の受信時刻, ms）。
     ///
     /// これが大きいスナップショットは「片方だけ古い」ことによる見かけ上の乖離を
@@ -158,12 +167,23 @@ impl DivergenceSnapshot {
             vwap_size,
             depth_a_bps10,
             depth_b_bps10,
+            book_crossed_a: book_a.is_crossed(),
+            book_crossed_b: book_b.is_crossed(),
             staleness_delta_ms,
             computed_at_wall_ms: now_wall_ms(),
             trigger_dex,
             trace_a,
             trace_b,
         })
+    }
+
+    /// どちらかの板がクロスしていたか。
+    ///
+    /// **true のスナップショットをアービトラージ機会として扱ってはいけない。**
+    /// クロスした板の best 気配は実際には取れない（取れるならすでに誰かが
+    /// 取っている）ので、乖離が実在するように見えてしまう。
+    pub fn has_crossed_book(&self) -> bool {
+        self.book_crossed_a || self.book_crossed_b
     }
 
     /// トリガーとなった側の内部処理時間（受信 → 判定完了）。
@@ -389,6 +409,28 @@ mod tests {
         assert!(DivergenceSnapshot::compute(&a, &other_symbol, Dex::EdgeX, None).is_none());
         // 同一 DEX 同士は比較しない
         assert!(DivergenceSnapshot::compute(&a, &a, Dex::Hyperliquid, None).is_none());
+    }
+
+    #[test]
+    fn crossed_books_are_flagged_but_still_recorded() {
+        // dYdX ではクロスが構造上正常に起こる。行は残しつつフラグで区別する。
+        let crossed = book(
+            Dex::Dydx,
+            vec![lvl(dec!(102), dec!(5))],
+            vec![lvl(dec!(101), dec!(5))],
+            1_000,
+        );
+        let (a, _) = flat_pair();
+
+        let s = DivergenceSnapshot::compute(&a, &crossed, Dex::Dydx, None).unwrap();
+        assert!(!s.book_crossed_a);
+        assert!(s.book_crossed_b);
+        assert!(s.has_crossed_book());
+
+        // 正常な板同士ならフラグは立たない
+        let (a, b) = flat_pair();
+        let s = DivergenceSnapshot::compute(&a, &b, Dex::Hyperliquid, None).unwrap();
+        assert!(!s.has_crossed_book());
     }
 
     #[test]

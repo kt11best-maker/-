@@ -30,6 +30,10 @@ pub const CSV_HEADER: &[&str] = &[
     "vwap_spread_bps",
     "depth_a_bps10",
     "depth_b_bps10",
+    // dYdX ではクロスした板が構造上正常に起こる。true の行は
+    // アービトラージ機会として扱わないこと。
+    "book_crossed_a",
+    "book_crossed_b",
     "staleness_delta_ms",
     "latency_a_ms",
     "latency_b_ms",
@@ -249,6 +253,8 @@ pub fn snapshot_to_row(snap: &DivergenceSnapshot) -> Vec<String> {
         fmt_opt(snap.vwap_spread_bps.map(fmt_bps)),
         snap.depth_a_bps10.0.normalize().to_string(),
         snap.depth_b_bps10.0.normalize().to_string(),
+        snap.book_crossed_a.to_string(),
+        snap.book_crossed_b.to_string(),
         snap.staleness_delta_ms.to_string(),
         fmt_opt(snap.exchange_latency_ms(snap.dex_a)),
         fmt_opt(snap.exchange_latency_ms(snap.dex_b)),
@@ -478,6 +484,41 @@ mod tests {
         // トリガー側のみ内部処理時間が入る
         assert!(!rows[1][idx("pipeline_latency_us")].is_empty());
         assert!(!rows[1][idx("vwap_spread_bps")].is_empty());
+    }
+
+    #[test]
+    fn crossed_book_columns_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = recorder_in(dir.path(), CsvMode::All);
+
+        let mut trace = MessageTrace::on_receive();
+        trace.received_wall_ms = 1_700_000_000_000;
+        trace.mark_normalized();
+        // dYdX 側だけクロスさせる
+        let crossed = OrderBook::new(
+            Dex::Dydx,
+            Symbol::Btc,
+            vec![Level::new(Price(dec!(102)), Quantity(dec!(30)))],
+            vec![Level::new(Price(dec!(101)), Quantity(dec!(30)))],
+            trace,
+        );
+        let normal = OrderBook::new(
+            Dex::Hyperliquid,
+            Symbol::Btc,
+            vec![Level::new(Price(dec!(100)), Quantity(dec!(30)))],
+            vec![Level::new(Price(dec!(101)), Quantity(dec!(30)))],
+            trace,
+        );
+        let mut snap = DivergenceSnapshot::compute(&normal, &crossed, Dex::Dydx, None).unwrap();
+        snap.computed_at_wall_ms = 1_700_000_000_000;
+        rec.record(&snap).unwrap();
+        rec.flush().unwrap();
+
+        let rows = read_csv(&dir.path().join("2023-11-14_BTC.csv"));
+        let idx = |name: &str| CSV_HEADER.iter().position(|h| *h == name).unwrap();
+        assert_eq!(rows[1][idx("book_crossed_a")], "false");
+        assert_eq!(rows[1][idx("book_crossed_b")], "true");
+        assert_eq!(rows[1][idx("dex_b")], "dydx");
     }
 
     #[test]

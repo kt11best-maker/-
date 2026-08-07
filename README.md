@@ -9,13 +9,14 @@ DEX パーペチュアル・アービトラージ Bot の実装。**実弾は一
 | 価格差アービトラージ | DEX 間の一時的な価格乖離 | 極めて高い（数十〜数百 ms） | 秒〜分 | IOC 同時発注 |
 | ファンディング裁定 | DEX 間のファンディングレート差 | 低い（数分〜数時間） | 時間〜日 | 指値でじっくり |
 
-フェーズ1 の対象 DEX は **Hyperliquid + Lighter の 2 つ**。両者とも**ファンディング
-精算間隔が 1 時間**で揃うため、レートを直接比較でき裁定の設計が単純になる。
-edgeX / Aster は実装済みだが**設定で無効化**している（コードもテストも残す）。
+フェーズ1 で**稼働させる** DEX は **Hyperliquid + Lighter の 2 つ**。両者とも
+**ファンディング精算間隔が 1 時間**で揃うため、レートを直接比較でき裁定の設計が
+単純になる。edgeX / Aster / dYdX は実装済みだが**設定で無効化**している
+（コードもテストも残す。再開は `enabled = true` だけでよい）。
 
-現在の到達点: 板データの 24 時間収集と、両戦略の**判定ロジック**（純粋関数）。
-発注・状態機械・永続化・通知はフェーズ3 以降で、まだ存在しない。
-ファンディングレートの**収集**も未実装（下記「未実装」を参照）。
+現在の到達点: 板データとファンディングレートの 24 時間収集、両戦略の**判定
+ロジック**（純粋関数）。発注・状態機械・永続化・通知はフェーズ3 以降で、
+まだ存在しない。
 
 ## クイックスタート
 
@@ -29,6 +30,7 @@ cargo run --release -p collector -- --config config/collector.toml
 出力先:
 
 - `data/YYYY-MM-DD_<SYMBOL>.csv` — 価格差スナップショット（銘柄ごと・日次）
+- `data/YYYY-MM-DD_<SYMBOL>_funding.csv` — ファンディングレート（**1 行 = 1 DEX**）
 - `logs/collector.log.YYYY-MM-DD` — 運用イベント（JSON, 日次ローテーション）
 
 ログレベルは `RUST_LOG=debug` で上書きできる（設定ファイルより優先）。
@@ -39,11 +41,12 @@ cargo run --release -p collector -- --config config/collector.toml
 perp-arb-bot/
 ├── crates/
 │   ├── core-types/       # Price / Quantity / OrderBook / MessageTrace など共通型
-│   ├── dex-traits/       # MarketDataSource trait・接続状態・バックオフ
+│   ├── dex-traits/       # MarketDataSource / FundingRateSource trait・接続状態・バックオフ
 │   ├── dex-hyperliquid/  # Hyperliquid の Market Data（WS + パース）
 │   ├── dex-edgex/        # edgeX の Market Data（WS + 差分再構築 + contractId 解決）
 │   ├── dex-aster/        # Aster の Market Data（WS 差分 + REST スナップショット）
 │   ├── dex-lighter/      # Lighter の Market Data（WS 一本化・market_index 動的解決）
+│   ├── dex-dydx/         # dYdX v4 の Market Data（Indexer WS・クロス板を許容）
 │   ├── market-data/      # BookStore / FundingStore・ペア列挙・価格差計算
 │   ├── strategy-traits/  # 戦略の共通インターフェース（TradeSignal / Strategy）
 │   ├── strategy-price-arb/    # 価格差アービトラージの判定
@@ -67,6 +70,8 @@ perp-arb-bot/
  ├─ spawn: 各 DEX の WS 購読タスク（有効なものだけ）─→ mpsc<OrderBook>
  ├─ spawn: 集約タスク（ペアごとに価格差を計算）    ─→ mpsc<DivergenceSnapshot>
  ├─ spawn: CSV writer タスク（バッファリングして定期 flush）
+ ├─ spawn: ファンディング収集タスク（対応 DEX のみ） ─→ mpsc<FundingRate>
+ ├─ spawn: ファンディング CSV writer タスク
  ├─ spawn: 監視タスク（接続状態・レイテンシ・スループット）
  └─ SIGINT/SIGTERM → CSV を flush して正常終了
 ```
@@ -81,16 +86,16 @@ perp-arb-bot/
 
 ### 比較ペアの列挙
 
-有効な DEX が N 個なら比較ペアは **N(N-1)/2 通り**（4 DEX なら 6 ペア）。ペアの
-向きは `Dex` の宣言順（hyperliquid → edgex → aster → lighter）に正規化されるため、
-CSV の `dex_a`/`dex_b` の並びと符号の意味は行ごとに変わらない。
+有効な DEX が N 個なら比較ペアは **N(N-1)/2 通り**（5 DEX なら 10 ペア）。ペアの
+向きは `Dex` の宣言順（hyperliquid → edgex → aster → lighter → dydx）に正規化される
+ため、CSV の `dex_a`/`dex_b` の並びと符号の意味は行ごとに変わらない。
 
 板の更新はどれか 1 つの DEX でしか起きないので、**更新された DEX を含むペアだけ**を
-再計算する（4 DEX なら 1 更新あたり 3 行）。その銘柄の板がまだ揃っていないペア
+再計算する（1 更新あたり N-1 行）。その銘柄の板がまだ揃っていないペア
 （= その DEX に市場が無い、未受信）は**正常系として黙ってスキップ**する。
 「全銘柄が全 DEX に存在する」前提は置かない。
 
-> **CSV の行数に注意**: 6 ペア × 4 銘柄では `csv_mode = "all"` のファイル増加が
+> **CSV の行数に注意**: ペア数 × 銘柄数が増えると `csv_mode = "all"` のファイル増加が
 > 速い。まず数十分だけ動かして実測し、24 時間分を見積もってから本稼働すること。
 > 必要なら `sampled` に切り替える（設定のみで、コード変更は不要）。
 
@@ -205,6 +210,7 @@ jq -r 'select(.fields.message | test("再接続|欠損|閾値超過"))' logs/col
 | `executable_spread_bps` | 実際に取れる方向の乖離（2 方向のうち有利な方） |
 | `vwap_spread_bps` | 想定ノーショナルでの VWAP ベース乖離（深さ不足なら空） |
 | `depth_a_bps10` / `depth_b_bps10` | 10bps 以内に収まる数量（bid/ask の薄い方） |
+| `book_crossed_a` / `book_crossed_b` | 各 DEX の板がクロス（bid >= ask）していたか |
 | `staleness_delta_ms` | A の受信時刻 − B の受信時刻 |
 | `latency_a_ms` / `latency_b_ms` | 各 DEX の取引所 → 受信の遅延 |
 | `pipeline_latency_us` | 内部処理時間（受信 → 判定完了, マイクロ秒） |
@@ -218,6 +224,68 @@ bps は基準価格に「両 mid の中点」を使う。A/B を入れ替えて�
 
 `staleness_delta_ms` が大きい行は「片方だけデータが古い」ことによる見かけ上の乖離を
 含む。フェーズ1 完了後の分析では、まずこれで絞り込んでから乖離幅を集計すること。
+
+`book_crossed_*` が `true` の行も同様に除外して集計すること。クロスした板の best 気配は
+実際には取れないため、乖離が実在するように見えてしまう。dYdX ではクロスが構造上正常に
+起こるので、この列は**発生頻度の計測そのもの**が目的でもある。
+
+## ファンディングレート CSV
+
+`data/YYYY-MM-DD_<SYMBOL>_funding.csv`。価格差 CSV とは**構造が違う**ので注意。
+
+| | 価格差 CSV | ファンディング CSV |
+|---|---|---|
+| 1 行の意味 | 1 ペアの比較（`dex_a` / `dex_b`） | **1 DEX の状態**（`dex` 1 列） |
+| 更新頻度 | 数十〜数百 ms | 数秒〜数分 |
+
+ペア比較は分析時に行う。ファンディングは更新頻度が低く、ペアで持つと同じ値が
+冗長に並ぶため。
+
+| カラム | 説明 |
+|---|---|
+| `timestamp_ms` | 記録時刻（wall clock, ms epoch） |
+| `symbol` / `dex` | 銘柄と取得元 DEX |
+| `current_rate` | 現在のレート（**1 回の精算あたり**。年率ではない） |
+| `predicted_rate` | 予測レート（提供する DEX のみ） |
+| `interval_hours` | 精算間隔（時間）。未設定なら空欄 |
+| `annualized_pct` | 年率換算（%）。**DEX 間比較はこの列で行う** |
+| `next_funding_time_ms` | 次回精算時刻（提供する DEX のみ） |
+| `index_price` / `mark_price` | インデックス価格・マーク価格 |
+| `exchange_ts_ms` / `latency_ms` | 取引所側タイムスタンプと遅延 |
+
+**記録は変化時のみ。** `current_rate` が前回と同じ行は書かない。ただし値が
+変わらなくても `heartbeat_interval_secs`（既定 300 秒）ごとに 1 行残す
+（**データの欠損と bot の停止を区別できるようにするため**）。
+
+### 精算間隔の正規化（最重要）
+
+DEX によってファンディングの精算間隔が異なる（1 時間ごと、8 時間ごとなど）。
+**間隔が違うレートをそのまま比較してはいけない。** 1 時間ごと 0.001% と
+8 時間ごと 0.008% は年率では同じ（8.76%）だが、`current_rate` は 8 倍違う。
+ここを取り違えると「8 倍の差がある」と誤認する。
+
+精算間隔に**既定値は持たせていない**。`[funding.intervals_hours]` に一次情報で
+確認した値を入れて初めて `annualized_pct` が埋まる。未設定なら空欄のまま残り、
+ファンディング裁定の判定からも（間隔不明として）外れる。推測値で埋めると年率換算が
+壊れて分析が無意味になるため、手数料と同じ扱いにしてある。
+
+### DEX ごとの対応状況
+
+| DEX | 取得方法 | 追加の接続 |
+|---|---|---|
+| Hyperliquid | `activeAssetCtx` チャンネル | 不要（板と同じ接続） |
+| Lighter | `market_stats:all`（既に購読済み） | 不要（受信済みメッセージから分岐） |
+| edgeX | 未対応（取得方法が未確認） | — |
+| Aster | 未対応（`@markPrice` で取れる見込み。§下記） | — |
+
+ファンディングは板とは**独立したパイプライン**。取得に失敗しても板の収集は止まらない。
+下流が詰まった場合はレートを**捨てる**（板の受信ループを 1 ms でも止めないため）。
+フェーズ1 の主目的は板データの収集で、ファンディングはその邪魔をしない。
+
+> Aster を有効化してファンディングも取る場合、`<symbol>@markPrice` は既存の
+> `<symbol>@depth@100ms` と同じ接続に相乗りできるが、**受信メッセージが 1 秒
+> あたり 10 件までという制約**がある。4 銘柄 × (depth 10 件/秒 + markPrice 1 件/秒)
+> が上限に触れないか必ず計算すること。触れる場合は接続を分けるか `@3s` を使う。
 
 ## 設定
 
@@ -242,6 +310,10 @@ bps は基準価格に「両 mid の中点」を使う。A/B を入れ替えて�
 | `strategy.funding_arb.max_adverse_basis_bps` | 2.0 | これ以上不利なベーシスでは建てない |
 | `strategy.funding_arb.count_favorable_basis` | false | 有利なベーシスを利益に加算するか |
 | `strategy.funding_arb.max_holding_hours` | 72 | 最大保有時間 |
+| `funding.enabled` | true | ファンディング収集の有効/無効 |
+| `funding.intervals_hours.<dex>` | なし | **未設定なら年率換算しない** |
+| `recording.funding.heartbeat_interval_secs` | 300 | 値が変わらなくても残す間隔 |
+| `dex.dydx.connected_timeout_secs` | 10 | `connected` を待つ上限 |
 | `allocation.*` | 0.30/0.40/0.30 | 戦略別の証拠金枠（合計 1.0 以下） |
 | `fees.<dex>.taker_bps` / `maker_bps` | なし | **未設定の DEX はシグナル対象外** |
 | `monitoring.latency_warn_threshold_ms` | 500 | 超過時に警告ログ |
@@ -257,6 +329,7 @@ DEX ごとに `excluded_symbols` で銘柄を落とせる。市場が存在し�
 | edgeX | 購読時スナップショット + 差分 | contractId 解決のみ（起動時 1 回、手動指定で回避可） |
 | Aster | 差分更新 | **必須**。初期化時と再同期時に `/fapi/v1/depth` |
 | Lighter | 購読時スナップショット + 差分 | **不要**（WS 一本化） |
+| dYdX v4 | 購読時スナップショット + 差分 | **不要**（Indexer WS で完結） |
 
 Aster だけは構造的に REST が外せない。差分方式のため基準スナップショットを REST でしか
 取得できず、`pu` の連続性が崩れるたびに再取得が要る。ここが IP ban のリスク源なので、
@@ -265,7 +338,7 @@ Aster だけは構造的に REST が外せない。差分方式のため基準�
 
 ### DEX ごとの keepalive 方式
 
-4 DEX で ping/pong の仕組みがすべて異なる。共通化せず各 crate で個別に実装している。
+5 DEX で ping/pong の仕組みがすべて異なる。共通化せず各 crate で個別に実装している。
 
 | DEX | 方式 |
 |---|---|
@@ -273,6 +346,10 @@ Aster だけは構造的に REST が外せない。差分方式のため基準�
 | edgeX | サーバーが**アプリ層の JSON** `{"type":"ping","time":"..."}` を送信 → pong を返す |
 | Aster | サーバーが**WS プロトコルの ping frame** を 5 分ごと送信 → 15 分以内に pong 必須 |
 | Lighter | **クライアントが 2 分に 1 回以上**フレームを送る責任がある |
+| dYdX v4 | サーバーが**WS プロトコルの ping frame** を 30 秒ごと送信 → 10 秒以内に pong 必須 |
+
+edgeX（アプリ層 JSON）と dYdX（プロトコル制御フレーム）は仕組みが別物なので、
+同じコードで扱おうとしないこと。
 
 ## 各 DEX の実装メモ
 
@@ -337,10 +414,47 @@ Aster だけは構造的に REST が外せない。差分方式のため基準�
 > **注意**: Lighter の taker/maker 手数料は `market_stats` に含まれない。フェーズ2 の
 > 利益判定を実装する段階で REST から起動時 1 回だけ取得する想定。フェーズ1 では不要。
 
+### dYdX v4
+
+- WS: `wss://indexer.dydx.trade/v4/ws`（testnet あり。公式に提供されているので
+  フェーズ3 の機能検証に使える）
+- **`connected` を受信してから購読する。** 接続直後に送ってはいけない。
+- `{"type":"subscribe","channel":"v4_orderbook","id":"BTC-USD"}`。銘柄表記は
+  ハイフン区切りの USD 建て。
+- `subscribed` が全量スナップショット（受信時にローカル板を必ずリセットしてから
+  作り直す）、以降は `channel_data` の差分。**`size` が 0 の価格レベルは削除。**
+  順序検証は `message_id`。
+- Ping は WS **プロトコルレベルの制御フレーム**（30 秒ごと、10 秒以内に pong）。
+
+> #### 板がクロスすることがある（乖離判定に直結）
+>
+> dYdX は中央集権的なオーダーブックを持たないため、**bid が ask より高い
+> （クロスした）板が観測されうる**。これは異常データではなく構造上正常に起こる。
+>
+> - クロスした板も**捨てずに**下流へ流す（`crossed_books` カウンタで頻度を計測）
+> - CSV には `book_crossed_a` / `book_crossed_b` として残す
+> - **クロスした板から計算した乖離はアービトラージ機会として扱わない**
+>   （`strategy-price-arb` が除外する）
+
+> #### Indexer のデータ鮮度
+>
+> Indexer はブロックチェーンの状態を追ってDBに反映する中間層で、真に正しい板
+> （ブロックプロポーザーの mempool 内）とは差がある。**dYdX の板は構造的に
+> 「少し古い」可能性がある。** `staleness_delta_ms` が dYdX を含む組み合わせで
+> 系統的に大きくなっていないか必ず確認すること。大きい場合、dYdX との乖離の多くは
+> 「見かけ上の乖離」である可能性が高い。
+>
+> 板メッセージに取引所側タイムスタンプが含まれないため `latency_ms` は空欄になる。
+> 鮮度は `staleness_delta_ms` で見ること。
+
+> **有効化前に確認すること**: `HYPE-USD` 市場の有無（無ければ
+> `excluded_symbols = ["HYPE"]`）、taker 手数料率、Indexer WS のレートリミットと
+> 同時接続数、板の深さが設定で変えられるか。
+
 ## テスト
 
 ```bash
-cargo test --workspace     # 233 tests
+cargo test --workspace     # 292 tests
 cargo clippy --workspace --all-targets
 ```
 
@@ -355,7 +469,13 @@ cargo clippy --workspace --all-targets
 - `dex-aster`: `U`/`u`/`pu` の連続性検証、スナップショット前のバッファリング、
   数量 0 による削除、存在しないレベルの削除、バッファ上限、REST 再同期
 - `dex-lighter`: `begin_nonce`/`nonce` の連続性検証、`offset` が飛んでも壊れないこと、
-  market_index の動的解決、解決できない銘柄のスキップ
+  market_index の動的解決、解決できない銘柄のスキップ、既存の `market_stats` 購読から
+  ファンディングが取れること（購読メッセージが増えないことも検証）
+- `dex-dydx`: `connected` 前に購読しないこと、**size=0 による価格レベル削除**、
+  `message_id` 欠損の検知と再購読、クロスした板が捨てられずカウントされること、
+  プロトコルレベル ping への pong 応答
+- `recorder`: 変化時のみ記録するロジック（同値の連続はスキップ、heartbeat 超過で記録）、
+  精算間隔が違っても `annualized_pct` が一致すること
 - `strategy-price-arb`: 手数料超え判定、鮮度差フィルタ、VWAP/best 気配の切替、
   板が薄い場合、手数料未設定時のスキップ、収束時の手仕舞い
 - `strategy-funding-arb`: 手数料回収回数、不利ベーシスの棄却、有利ベーシスを
@@ -387,10 +507,24 @@ cargo clippy --workspace --all-targets
 
 ## 未実装 / 保留
 
-- **ファンディングレートの収集**: `FundingRate` 型と `FundingStore`、判定ロジックは
-  実装済みだが、各 DEX からレートを取り込む部分はまだ無い。`FundingRate` の
-  フィールド構成は `funding-rate-collection-design.md` と突き合わせて確認すること。
-- **戦略の collector への結線**: フェーズ1 は板データ収集のみ。シグナル記録は
-  フェーズ2（ドライラン）で行う。
+- **edgeX / Aster のファンディング取得**: edgeX は取得方法が未確認、Aster は
+  `@markPrice` で取れる見込みだがレートリミットの計算が要る。どちらも現在は
+  板のみ収集する（起動時に警告を出す）。
+- **戦略の collector への結線**: フェーズ1 は板・ファンディングの収集のみ。
+  シグナル記録はフェーズ2（ドライラン）で行う。
 - **execution / persistence / notifier**: フェーズ3 以降。
-- **dYdX の追加**: `dydx-integration-design.md` に従って実装する（未着手）。
+
+### 実 API と突き合わせて確認すべきこと
+
+この環境では外部への TLS 接続ができず（プロキシの証明書検証で弾かれる）、
+**実 API のレスポンス形式は未検証**。パーサはいずれも複数の形式を受け付けるように
+してあるが、実データと差異があれば各 crate の固定サンプルとテストを更新すること。
+
+| 項目 | 場所 |
+|---|---|
+| 各 DEX の**精算間隔** ← 最重要 | `[funding.intervals_hours]` |
+| ファンディングの**符号の向き**（正 = ロングが支払う、で全 DEX 統一か） | 各 dex crate |
+| Lighter の `funding_rate` の意味（予測値か直近確定値か） | `dex-lighter/src/message.rs` |
+| Hyperliquid `activeAssetCtx` のフィールド名 | `dex-hyperliquid/src/message.rs` |
+| dYdX の `HYPE-USD` 市場の有無、`message_id` の連番の仕様 | `dex-dydx/` |
+| 各 DEX の taker/maker 手数料率 | `[fees.<dex>]` |

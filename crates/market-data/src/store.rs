@@ -147,10 +147,14 @@ mod tests {
         store.update(book(Dex::Aster, Symbol::Hype, dec!(21), dec!(21.1)));
 
         let pairs = crate::pairs::pairs_involving(Dex::Aster, &Dex::ALL);
-        assert_eq!(pairs.len(), 3, "Aster を含むペアは 3 通り");
+        assert_eq!(
+            pairs.len(),
+            Dex::ALL.len() - 1,
+            "Aster を含むペアは自分以外の DEX の数だけある"
+        );
 
         let snapshots = store.divergences(Symbol::Hype, &pairs, Dex::Aster, None);
-        // edgeX / Lighter の板が無いペアはスキップされる
+        // 板が無いペア（edgeX / Lighter / dYdX）はスキップされる
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].dex_a, Dex::Hyperliquid);
         assert_eq!(snapshots[0].dex_b, Dex::Aster);
@@ -170,15 +174,16 @@ mod tests {
             Dex::Hyperliquid,
             None,
         );
-        assert_eq!(all.len(), 6, "4 DEX なら 6 ペア");
+        let n = Dex::ALL.len();
+        assert_eq!(all.len(), n * (n - 1) / 2, "N DEX なら N(N-1)/2 ペア");
 
-        // トリガー側を含むペアだけに絞ると 3 件
+        // トリガー側を含むペアだけに絞ると N-1 件
         let involving = store.divergences(
             Symbol::Btc,
             &crate::pairs::pairs_involving(Dex::Hyperliquid, &Dex::ALL),
             Dex::Hyperliquid,
             None,
         );
-        assert_eq!(involving.len(), 3);
+        assert_eq!(involving.len(), n - 1);
     }
 }

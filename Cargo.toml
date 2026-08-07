@@ -7,6 +7,7 @@ members = [
     "crates/dex-edgex",
     "crates/dex-aster",
     "crates/dex-lighter",
+    "crates/dex-dydx",
     "crates/market-data",
     "crates/recorder",
     "crates/config",
@@ -30,6 +31,7 @@ dex-hyperliquid = { path = "crates/dex-hyperliquid" }
 dex-edgex = { path = "crates/dex-edgex" }
 dex-aster = { path = "crates/dex-aster" }
 dex-lighter = { path = "crates/dex-lighter" }
+dex-dydx = { path = "crates/dex-dydx" }
 market-data = { path = "crates/market-data" }
 recorder = { path = "crates/recorder" }
 config = { path = "crates/config" }

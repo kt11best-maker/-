@@ -165,13 +165,16 @@ mod tests {
             s.entry_bps(Dex::Hyperliquid, Dex::Aster, ExecutionStyle::Taker),
             None
         );
-        assert_eq!(s.missing(&Dex::ALL), vec![Dex::EdgeX, Dex::Aster]);
+        assert_eq!(
+            s.missing(&Dex::ALL),
+            vec![Dex::EdgeX, Dex::Aster, Dex::Dydx]
+        );
     }
 
     #[test]
     fn empty_schedule_reports_everything_missing() {
         let s = FeeSchedule::new();
         assert!(s.is_empty());
-        assert_eq!(s.missing(&Dex::ALL).len(), 4);
+        assert_eq!(s.missing(&Dex::ALL).len(), Dex::ALL.len());
     }
 }

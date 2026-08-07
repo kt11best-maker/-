@@ -265,6 +265,8 @@ pub struct DexConfig {
     pub aster: AsterConfig,
     #[serde(default)]
     pub lighter: LighterConfig,
+    #[serde(default)]
+    pub dydx: DydxConfig,
 }
 
 /// 再接続まわりの共通パラメータ。
@@ -405,6 +407,35 @@ pub struct LighterConfig {
     pub excluded_symbols: Vec<Symbol>,
 }
 
+/// dYdX v4 の設定。
+///
+/// Indexer サービス経由の WS。testnet が公式に提供されているため、フェーズ3 の
+/// 機能検証はそちらを使える。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DydxConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_dydx_ws_url")]
+    pub ws_url: String,
+    #[serde(default = "default_dydx_testnet_ws_url")]
+    pub testnet_ws_url: String,
+    #[serde(default)]
+    pub use_testnet: bool,
+    #[serde(default = "default_reconnect_max_attempts")]
+    pub reconnect_max_attempts: u32,
+    #[serde(default = "default_reconnect_base_delay_ms")]
+    pub reconnect_base_delay_ms: u64,
+    #[serde(default = "default_reconnect_max_delay_ms")]
+    pub reconnect_max_delay_ms: u64,
+    /// `connected` メッセージを待つ上限（秒）。これを超えたら接続をやり直す。
+    #[serde(default = "default_dydx_connected_timeout_secs")]
+    pub connected_timeout_secs: u64,
+    /// dYdX に存在しない銘柄はここで除外する（例: `HYPE-USD` が無い場合）。
+    #[serde(default)]
+    pub excluded_symbols: Vec<Symbol>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CsvMode {
@@ -526,6 +557,11 @@ impl Config {
                     .into(),
             ));
         }
+        if self.dex.dydx.enabled && self.dex.dydx.connected_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "dydx.connected_timeout_secs は 1 以上".into(),
+            ));
+        }
         if self.funding.enabled && self.funding.channel_capacity == 0 {
             return Err(ConfigError::Invalid(
                 "funding.channel_capacity は 1 以上".into(),
@@ -641,6 +677,7 @@ impl Config {
             Dex::EdgeX => self.dex.edgex.enabled,
             Dex::Aster => self.dex.aster.enabled,
             Dex::Lighter => self.dex.lighter.enabled,
+            Dex::Dydx => self.dex.dydx.enabled,
         }
     }
 
@@ -661,6 +698,7 @@ impl Config {
             Dex::EdgeX => &self.dex.edgex.excluded_symbols,
             Dex::Aster => &self.dex.aster.excluded_symbols,
             Dex::Lighter => &self.dex.lighter.excluded_symbols,
+            Dex::Dydx => &self.dex.dydx.excluded_symbols,
         };
         self.general
             .symbols
@@ -729,6 +767,25 @@ impl AsterConfig {
             Some(std::time::Duration::from_secs(
                 self.reconnect_before_hours * 3_600,
             ))
+        }
+    }
+}
+
+impl DydxConfig {
+    pub fn reconnect_policy(&self) -> ReconnectPolicy {
+        ReconnectPolicy {
+            max_attempts: self.reconnect_max_attempts,
+            base_delay_ms: self.reconnect_base_delay_ms,
+            max_delay_ms: self.reconnect_max_delay_ms,
+        }
+    }
+
+    /// `use_testnet` に応じた接続先。
+    pub fn effective_ws_url(&self) -> &str {
+        if self.use_testnet {
+            &self.testnet_ws_url
+        } else {
+            &self.ws_url
         }
     }
 }
@@ -827,6 +884,15 @@ fn default_lighter_keepalive_secs() -> u64 {
 }
 fn default_lighter_mapping_warn_secs() -> u64 {
     30
+}
+fn default_dydx_ws_url() -> String {
+    "wss://indexer.dydx.trade/v4/ws".to_string()
+}
+fn default_dydx_testnet_ws_url() -> String {
+    "wss://indexer.v4testnet.dydx.exchange/v4/ws".to_string()
+}
+fn default_dydx_connected_timeout_secs() -> u64 {
+    10
 }
 fn default_taker() -> FillStyle {
     FillStyle::Taker
@@ -1008,6 +1074,22 @@ impl Default for LighterConfig {
             reconnect_base_delay_ms: default_reconnect_base_delay_ms(),
             reconnect_max_delay_ms: default_reconnect_max_delay_ms(),
             mapping_warn_secs: default_lighter_mapping_warn_secs(),
+            excluded_symbols: Vec::new(),
+        }
+    }
+}
+
+impl Default for DydxConfig {
+    fn default() -> Self {
+        DydxConfig {
+            enabled: true,
+            ws_url: default_dydx_ws_url(),
+            testnet_ws_url: default_dydx_testnet_ws_url(),
+            use_testnet: false,
+            reconnect_max_attempts: default_reconnect_max_attempts(),
+            reconnect_base_delay_ms: default_reconnect_base_delay_ms(),
+            reconnect_max_delay_ms: default_reconnect_max_delay_ms(),
+            connected_timeout_secs: default_dydx_connected_timeout_secs(),
             excluded_symbols: Vec::new(),
         }
     }
@@ -1202,11 +1284,21 @@ staleness_warn_threshold_ms = 1000
         assert!(cfg.validate().is_err());
 
         let mut cfg = Config::default();
-        cfg.dex.hyperliquid.enabled = false;
-        cfg.dex.edgex.enabled = false;
-        cfg.dex.aster.enabled = false;
-        cfg.dex.lighter.enabled = false;
-        assert!(cfg.validate().is_err());
+        for dex in Dex::ALL {
+            set_enabled(&mut cfg, dex, false);
+        }
+        assert!(cfg.validate().is_err(), "全 DEX 無効は不正");
+    }
+
+    /// テスト用に DEX の有効/無効を切り替える。
+    fn set_enabled(cfg: &mut Config, dex: Dex, enabled: bool) {
+        match dex {
+            Dex::Hyperliquid => cfg.dex.hyperliquid.enabled = enabled,
+            Dex::EdgeX => cfg.dex.edgex.enabled = enabled,
+            Dex::Aster => cfg.dex.aster.enabled = enabled,
+            Dex::Lighter => cfg.dex.lighter.enabled = enabled,
+            Dex::Dydx => cfg.dex.dydx.enabled = enabled,
+        }
     }
 
     #[test]
@@ -1320,6 +1412,7 @@ excluded_symbols = ["HYPE"]
         let mut cfg = Config::default();
         cfg.dex.edgex.enabled = false;
         cfg.dex.lighter.enabled = false;
+        cfg.dex.dydx.enabled = false;
         assert_eq!(cfg.enabled_dexes(), vec![Dex::Hyperliquid, Dex::Aster]);
         cfg.validate().unwrap();
 
@@ -1387,7 +1480,10 @@ heartbeat_interval_secs = 300
         );
         // 設定していない DEX は不明のまま
         assert_eq!(cfg.funding_interval_hours(Dex::EdgeX), None);
-        assert_eq!(cfg.dexes_missing_funding_interval(), vec![Dex::EdgeX]);
+        assert_eq!(
+            cfg.dexes_missing_funding_interval(),
+            vec![Dex::EdgeX, Dex::Dydx]
+        );
         assert_eq!(cfg.recording.funding.heartbeat_interval_secs, 300);
     }
 

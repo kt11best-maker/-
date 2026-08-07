@@ -213,8 +213,41 @@ impl OrderBook {
         Some(diff / best.0 * BPS_DENOMINATOR)
     }
 
+    /// best_bid >= best_ask か。
+    ///
+    /// 多くの DEX ではデータ破損のサインだが、**dYdX v4 では構造上正常に
+    /// 起こる**（中央集権的なオーダーブックを持たないため）。
+    /// そのため「エラー」ではなく「状態」として取り出せるようにしてある。
+    pub fn is_crossed(&self) -> bool {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(b), Some(a)) => b >= a,
+            _ => false,
+        }
+    }
+
     /// 板の整合性チェック。差分更新の再構築ロジックのバグを早期に検知する。
+    ///
+    /// クロスもエラーとして扱う。クロスが正常に起こる DEX では
+    /// [`OrderBook::validate_allowing_crossed`] を使うこと。
     pub fn validate(&self) -> Result<(), BookIntegrityError> {
+        self.validate_allowing_crossed()?;
+        if let (Some(b), Some(a)) = (self.best_bid(), self.best_ask()) {
+            if b >= a {
+                return Err(BookIntegrityError::Crossed {
+                    best_bid: b,
+                    best_ask: a,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// クロス以外の整合性チェック。
+    ///
+    /// dYdX のようにクロスが正常に起こる DEX 向け。**クロスした板を捨てては
+    /// いけない**（クロスの発生頻度自体がフェーズ1 の計測対象）。ソート順・
+    /// 数量の異常は依然としてバグのサインなので検査する。
+    pub fn validate_allowing_crossed(&self) -> Result<(), BookIntegrityError> {
         if self.bids.windows(2).any(|w| w[0].price < w[1].price) {
             return Err(BookIntegrityError::BidsNotDescending);
         }
@@ -228,14 +261,6 @@ impl OrderBook {
             .any(|l| !l.quantity.is_positive())
         {
             return Err(BookIntegrityError::NonPositiveQuantity);
-        }
-        if let (Some(b), Some(a)) = (self.best_bid(), self.best_ask()) {
-            if b >= a {
-                return Err(BookIntegrityError::Crossed {
-                    best_bid: b,
-                    best_ask: a,
-                });
-            }
         }
         Ok(())
     }
@@ -449,5 +474,48 @@ mod tests {
         let mut b = book();
         b.bids[0].quantity = Quantity(dec!(0));
         assert_eq!(b.validate(), Err(BookIntegrityError::NonPositiveQuantity));
+    }
+
+    #[test]
+    fn is_crossed_detects_bid_above_ask() {
+        assert!(!book().is_crossed());
+        // 板が片側だけの場合はクロスとは言えない
+        assert!(!empty_book().is_crossed());
+
+        let mut b = book();
+        b.asks[0].price = Price(dec!(99));
+        assert!(b.is_crossed());
+
+        // best_bid == best_ask もクロス扱い（同値で両方向に約定できてしまう）
+        let mut b = book();
+        b.asks[0].price = Price(dec!(100));
+        assert!(b.is_crossed());
+    }
+
+    #[test]
+    fn validate_allowing_crossed_accepts_crossed_books() {
+        // dYdX ではクロスが構造上正常に起こる。板を捨てないための入口。
+        let mut b = book();
+        b.asks[0].price = Price(dec!(99));
+        assert!(matches!(
+            b.validate(),
+            Err(BookIntegrityError::Crossed { .. })
+        ));
+        assert_eq!(b.validate_allowing_crossed(), Ok(()));
+
+        // ソート順や数量の異常は許容しない（差分再構築のバグを見逃さないため）
+        let mut broken = b.clone();
+        broken.bids.reverse();
+        assert_eq!(
+            broken.validate_allowing_crossed(),
+            Err(BookIntegrityError::BidsNotDescending)
+        );
+
+        let mut broken = b.clone();
+        broken.asks[0].quantity = Quantity(dec!(0));
+        assert_eq!(
+            broken.validate_allowing_crossed(),
+            Err(BookIntegrityError::NonPositiveQuantity)
+        );
     }
 }

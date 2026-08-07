@@ -34,6 +34,7 @@ use anyhow::{Context, Result};
 use config::Config;
 use core_types::Dex;
 use dex_aster::AsterMarketData;
+use dex_dydx::DydxMarketData;
 use dex_edgex::EdgeXMarketData;
 use dex_hyperliquid::HyperliquidMarketData;
 use dex_lighter::LighterMarketData;
@@ -243,6 +244,11 @@ fn build_sources(cfg: &Config) -> Result<Sources> {
         if collect_funding {
             funding.push(source as Arc<dyn FundingRateSource>);
         }
+    }
+    if cfg.dex.dydx.enabled {
+        // dYdX のファンディング取得は未実装（板のみ）。
+        // クロスした板が正常に起こるため、乖離判定側での除外が前提。
+        market_data.push(Arc::new(DydxMarketData::new(cfg.dex.dydx.clone())));
     }
 
     for dex in Dex::ALL {

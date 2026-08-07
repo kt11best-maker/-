@@ -13,6 +13,7 @@ path = "src/main.rs"
 config.workspace = true
 core-types.workspace = true
 dex-aster.workspace = true
+dex-dydx.workspace = true
 dex-edgex.workspace = true
 dex-lighter.workspace = true
 dex-hyperliquid.workspace = true

@@ -81,6 +81,24 @@ reconnect_max_delay_ms = 30000
 mapping_warn_secs = 30
 excluded_symbols = []
 
+[dex.dydx]
+# 一時無効化。まず dYdX 単体で板が正しく再構築できているか
+# （クロス発生率・size=0 処理）を確認してから有効化すること。
+enabled = false
+ws_url = "wss://indexer.dydx.trade/v4/ws"
+# testnet が公式に提供されているため、フェーズ3 の機能検証はこちらを使える
+testnet_ws_url = "wss://indexer.v4testnet.dydx.exchange/v4/ws"
+use_testnet = false
+reconnect_max_attempts = 10
+reconnect_base_delay_ms = 500
+reconnect_max_delay_ms = 30000
+# connected メッセージを待つ上限（秒）。接続直後に購読を送ってはいけない
+connected_timeout_secs = 10
+# dYdX に存在しない銘柄はここで除外する。
+# HYPE-USD 市場が存在するかは未確認のため、有効化前に必ず確認すること
+# （無ければ excluded_symbols = ["HYPE"] にする）。
+excluded_symbols = []
+
 [recording]
 csv_dir = "data"
 log_dir = "logs"

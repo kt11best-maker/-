@@ -28,7 +28,7 @@ pub fn dex_pairs(dexes: &[Dex]) -> Vec<(Dex, Dex)> {
 ///
 /// 板が更新されるたびに全ペアを再計算すると、更新の無かった DEX 同士の行が
 /// 同じ内容で何度も出力される。イベント駆動では「更新された DEX を含むペア」
-/// だけを再計算すれば十分（N=4 なら 1 更新あたり 3 ペア）。
+/// だけを再計算すれば十分（N 個の DEX なら 1 更新あたり N-1 ペア）。
 pub fn pairs_involving(dex: Dex, dexes: &[Dex]) -> Vec<(Dex, Dex)> {
     dex_pairs(dexes)
         .into_iter()
@@ -48,8 +48,9 @@ mod tests {
             dex_pairs(&[Dex::Hyperliquid, Dex::EdgeX]),
             vec![(Dex::Hyperliquid, Dex::EdgeX)]
         );
-        // 4 DEX → 6 ペア
-        assert_eq!(dex_pairs(&Dex::ALL).len(), 6);
+        // N(N-1)/2 通り。DEX を追加してもこの関係は変わらない
+        let n = Dex::ALL.len();
+        assert_eq!(dex_pairs(&Dex::ALL).len(), n * (n - 1) / 2);
     }
 
     #[test]
@@ -65,9 +66,13 @@ mod tests {
                 (Dex::Hyperliquid, Dex::EdgeX),
                 (Dex::Hyperliquid, Dex::Aster),
                 (Dex::Hyperliquid, Dex::Lighter),
+                (Dex::Hyperliquid, Dex::Dydx),
                 (Dex::EdgeX, Dex::Aster),
                 (Dex::EdgeX, Dex::Lighter),
+                (Dex::EdgeX, Dex::Dydx),
                 (Dex::Aster, Dex::Lighter),
+                (Dex::Aster, Dex::Dydx),
+                (Dex::Lighter, Dex::Dydx),
             ]
         );
     }
@@ -83,7 +88,8 @@ mod tests {
     #[test]
     fn pairs_involving_selects_only_relevant_ones() {
         let involving = pairs_involving(Dex::Aster, &Dex::ALL);
-        assert_eq!(involving.len(), 3);
+        // 自分以外の全 DEX と 1 ペアずつ
+        assert_eq!(involving.len(), Dex::ALL.len() - 1);
         assert!(involving
             .iter()
             .all(|(a, b)| *a == Dex::Aster || *b == Dex::Aster));

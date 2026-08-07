@@ -57,6 +57,13 @@ impl PriceArbStrategy {
             return None;
         }
 
+        // クロスした板（dYdX では構造上正常に起こる）から計算した乖離は
+        // アービトラージ機会として扱わない。best 気配が実際には取れないため、
+        // 存在しない乖離を捉えたことになる。
+        if snapshot.has_crossed_book() {
+            return None;
+        }
+
         // 執行方向: 高い方で売り（ショート）、安い方で買い（ロング）
         let (short_dex, long_dex) = match snapshot.executable_direction {
             ExecutableDirection::SellABuyB => (snapshot.dex_a, snapshot.dex_b),
@@ -230,6 +237,55 @@ mod tests {
             max_staleness_delta_ms: 250,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn crossed_books_are_excluded_from_signals() {
+        // dYdX の板がクロスしている状態。乖離は大きく見えるが実際には取れない。
+        let books = BookStore::new();
+        books.update(book(
+            Dex::Hyperliquid,
+            dec!(100),
+            dec!(100.1),
+            dec!(100),
+            1_000,
+        ));
+        // bid 102 > ask 101 のクロス板
+        books.update(book(Dex::Dydx, dec!(102), dec!(101), dec!(100), 1_000));
+
+        let mut fees = FeeSchedule::new();
+        for dex in [Dex::Hyperliquid, Dex::Dydx] {
+            fees.insert(
+                dex,
+                DexFees {
+                    taker_bps: dec!(1),
+                    maker_bps: dec!(0),
+                },
+            );
+        }
+        let f = Fixture {
+            books,
+            funding: FundingStore::new(),
+            fees,
+            symbols: vec![Symbol::Btc],
+            pairs: vec![(Dex::Hyperliquid, Dex::Dydx)],
+        };
+
+        // 乖離自体は記録される（フェーズ1 の計測対象）
+        let snapshot = f
+            .books
+            .divergence(Symbol::Btc, Dex::Hyperliquid, Dex::Dydx, Dex::Dydx, None)
+            .unwrap();
+        assert!(snapshot.book_crossed_b);
+        assert!(
+            snapshot.executable_spread_bps > Decimal::ZERO,
+            "見かけ上は取れる"
+        );
+
+        // が、シグナルにはしない
+        assert!(PriceArbStrategy::new(config())
+            .evaluate(&f.ctx())
+            .is_empty());
     }
 
     #[test]

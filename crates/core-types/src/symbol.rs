@@ -13,10 +13,17 @@ pub enum Dex {
     EdgeX,
     Aster,
     Lighter,
+    Dydx,
 }
 
 impl Dex {
-    pub const ALL: [Dex; 4] = [Dex::Hyperliquid, Dex::EdgeX, Dex::Aster, Dex::Lighter];
+    pub const ALL: [Dex; 5] = [
+        Dex::Hyperliquid,
+        Dex::EdgeX,
+        Dex::Aster,
+        Dex::Lighter,
+        Dex::Dydx,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -24,7 +31,17 @@ impl Dex {
             Dex::EdgeX => "edgex",
             Dex::Aster => "aster",
             Dex::Lighter => "lighter",
+            Dex::Dydx => "dydx",
         }
+    }
+
+    /// 板がクロス（bid > ask）することが**構造上正常に起こる**か。
+    ///
+    /// dYdX v4 は中央集権的なオーダーブックを持たないため、Indexer 経由で
+    /// クロスした板が観測されうる。これは異常データではないので、板を捨てずに
+    /// フラグを立てて記録し、アービトラージ判定からだけ除外する。
+    pub fn allows_crossed_book(&self) -> bool {
+        matches!(self, Dex::Dydx)
     }
 }
 
@@ -43,6 +60,7 @@ impl FromStr for Dex {
             "edgex" => Ok(Dex::EdgeX),
             "aster" => Ok(Dex::Aster),
             "lighter" => Ok(Dex::Lighter),
+            "dydx" | "dydx_v4" => Ok(Dex::Dydx),
             _ => Err(ParseSymbolError(s.to_string())),
         }
     }
@@ -83,9 +101,19 @@ impl Symbol {
     /// - Lighter: ベースシンボル（`"BTC"` 等）。Lighter は銘柄を**数値の
     ///   market_index** で識別するため、この文字列は `market_stats` の `symbol`
     ///   と照合して market_index を動的に引くためのキーにしか使わない。
+    /// - dYdX v4: マーケット ID（`"BTC-USD"` 等）。購読メッセージの `id` に
+    ///   そのまま渡す。**HYPE-USD 市場が存在するかは未確認**のため、無ければ
+    ///   `excluded_symbols` で外すこと（銘柄 × DEX の組み合わせが存在しない
+    ///   ケースはパイプライン全体で正常系として扱う）。
     pub fn to_dex_symbol(&self, dex: Dex) -> &'static str {
         match dex {
             Dex::Hyperliquid | Dex::Lighter => self.as_str(),
+            Dex::Dydx => match self {
+                Symbol::Btc => "BTC-USD",
+                Symbol::Eth => "ETH-USD",
+                Symbol::Sol => "SOL-USD",
+                Symbol::Hype => "HYPE-USD",
+            },
             Dex::EdgeX => match self {
                 Symbol::Btc => "BTCUSD",
                 Symbol::Eth => "ETHUSD",
@@ -226,14 +254,38 @@ mod tests {
         assert!(Dex::Hyperliquid < Dex::EdgeX);
         assert!(Dex::EdgeX < Dex::Aster);
         assert!(Dex::Aster < Dex::Lighter);
-        assert_eq!(Dex::ALL.len(), 4);
+        assert!(Dex::Lighter < Dex::Dydx);
+        assert_eq!(Dex::ALL.len(), 5);
     }
 
     #[test]
     fn dex_parses_from_string() {
         assert_eq!("aster".parse::<Dex>().unwrap(), Dex::Aster);
         assert_eq!("Lighter".parse::<Dex>().unwrap(), Dex::Lighter);
-        assert!("dydx".parse::<Dex>().is_err());
+        assert_eq!("dydx".parse::<Dex>().unwrap(), Dex::Dydx);
+        assert!("binance".parse::<Dex>().is_err());
+    }
+
+    #[test]
+    fn dydx_uses_hyphenated_usd_markets() {
+        assert_eq!(Symbol::Btc.to_dex_symbol(Dex::Dydx), "BTC-USD");
+        assert_eq!(Symbol::Sol.to_dex_symbol(Dex::Dydx), "SOL-USD");
+        // 購読メッセージの id にそのまま使うので大文字のまま
+        assert_eq!(Symbol::Btc.to_stream_symbol(Dex::Dydx), "BTC-USD");
+        assert_eq!(
+            Symbol::from_dex_symbol(Dex::Dydx, "eth-usd"),
+            Some(Symbol::Eth)
+        );
+        // 他 DEX の表記とは混同しない
+        assert_eq!(Symbol::from_dex_symbol(Dex::Dydx, "BTCUSD"), None);
+    }
+
+    #[test]
+    fn only_dydx_allows_crossed_books() {
+        assert!(Dex::Dydx.allows_crossed_book());
+        for dex in [Dex::Hyperliquid, Dex::EdgeX, Dex::Aster, Dex::Lighter] {
+            assert!(!dex.allows_crossed_book(), "{dex}");
+        }
     }
 
     #[test]
