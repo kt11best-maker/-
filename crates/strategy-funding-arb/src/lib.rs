@@ -39,6 +39,7 @@ use strategy_traits::{
     ExitReason, MarketContext, OpenPosition, SignalRationale, Strategy, StrategyKind, TradeSignal,
     Urgency,
 };
+use tracing::debug;
 
 pub struct FundingArbStrategy {
     cfg: FundingArbConfig,
@@ -86,6 +87,29 @@ impl FundingArbStrategy {
         if breakeven > self.cfg.expected_intervals {
             // 想定保有回数の中で回収できない
             return None;
+        }
+
+        // ベーシス判定の前に板の鮮度を確認する。片方だけ古い板では、実在しない
+        // 不利ベーシスで機会を逃すか、実在する不利ベーシスを見逃す。
+        // 判定できない以上、安全側に倒してシグナルを出さない。
+        match ctx.staleness_delta_ms(symbol, spread.long_dex, spread.short_dex) {
+            Some(delta) if delta.abs() > self.cfg.max_staleness_delta_ms => {
+                // フェーズ1〜2 の分析で「この理由でどれだけ機会を落としたか」を
+                // 追えるようにログに残す。
+                debug!(
+                    strategy = %StrategyKind::FundingArb,
+                    symbol = %symbol,
+                    long_dex = %spread.long_dex,
+                    short_dex = %spread.short_dex,
+                    staleness_delta_ms = delta,
+                    threshold_ms = self.cfg.max_staleness_delta_ms,
+                    rate_diff_bps = %spread.rate_diff_bps,
+                    "板の鮮度差が大きいためファンディング裁定の判定をスキップ"
+                );
+                return None;
+            }
+            // 板が揃っていなければベーシスも取れない（下の ? で弾かれる）
+            _ => {}
         }
 
         // 建てる方向で価格差が有利(正)か不利(負)か
@@ -147,6 +171,20 @@ impl FundingArbStrategy {
         (spread.long_dex == position.long_dex && spread.short_dex == position.short_dex)
             .then_some(spread)
     }
+
+    /// 両 DEX のファンディングデータが揃っているか。
+    ///
+    /// レート差の消滅とデータ欠損は原因が違う（後者は API 不調・WS 切断の
+    /// 疑い）。[`ExitReason`] を分けるためにここで区別する。
+    fn funding_data_available(position: &OpenPosition, ctx: &MarketContext<'_>) -> bool {
+        ctx.funding
+            .get(position.long_dex, position.symbol)
+            .is_some()
+            && ctx
+                .funding
+                .get(position.short_dex, position.symbol)
+                .is_some()
+    }
 }
 
 impl Strategy for FundingArbStrategy {
@@ -171,9 +209,34 @@ impl Strategy for FundingArbStrategy {
 
     /// 解消判定。
     ///
-    /// 1. レート差が消滅・反転した → [`ExitReason::FundingEdgeGone`]
-    /// 2. レート差が建てる基準を割った → [`ExitReason::FundingBelowCost`]
-    /// 3. 最大保有期間に到達 → [`ExitReason::MaxHoldingReached`]
+    /// # エントリーとエグジットは同じ基準で判断してはいけない
+    ///
+    /// エントリーは手数料を `expected_intervals` で按分して採算を見る。つまり
+    /// 「その回数だけ精算をまたぐ」前提で建てている。にもかかわらず、エントリー
+    /// 基準（`min_rate_diff_bps`）を割った瞬間に降りると、**手数料を回収し切る
+    /// 前に確定損を出す**。
+    ///
+    /// 例: レート差 3bps/精算・手数料 6bps（breakeven 2 回）で建て、1 回精算した
+    /// 時点でレート差が 0.9bps に細って降りた場合 →
+    /// 収益 3bps − 手数料 6bps = **−3bps の確定損**。
+    ///
+    /// **すでに払った手数料はサンクコスト**なので、降りる判断は「エントリー基準を
+    /// 割ったか」ではなく「**今後の期待収益 vs 今降りるコスト**」で行う。
+    ///
+    /// # 判定の 4 系統
+    ///
+    /// 1. 最大保有期間に到達 → [`ExitReason::MaxHoldingReached`]
+    ///    （レートが見えなくても効かせたいので最初に見る）
+    /// 2. データ欠損 → [`ExitReason::FundingDataUnavailable`]
+    /// 3. **反転**（保有と逆向きになった / レート差が消滅） →
+    ///    [`ExitReason::FundingEdgeGone`]。保有し続ける理由が消えているので
+    ///    **breakeven 未達でも即降りる**
+    /// 4. **細っただけ** → breakeven を回収するまでは保有継続。回収後は
+    ///    `exit_rate_diff_bps`（エントリーより**低い**独立した閾値）を下回ったら
+    ///    [`ExitReason::FundingBelowCost`]
+    ///
+    /// `min_rate_diff_bps` と `exit_rate_diff_bps` の差がヒステリシス帯になり、
+    /// 閾値付近でレート差が振動しても建て直しを繰り返さない。
     ///
     /// 証拠金維持率の悪化とキルスイッチはリスク管理層の担当で、ここでは見ない。
     fn should_exit(&self, position: &OpenPosition, ctx: &MarketContext<'_>) -> Option<ExitReason> {
@@ -181,17 +244,27 @@ impl Strategy for FundingArbStrategy {
             return None;
         }
 
-        // 3. 最大保有期間（レートが見えなくても効かせたいので最初に見る）
+        // 1. 最大保有期間（レートが見えなくても効かせたいので最初に見る）
         if position.holding_hours(ctx.now_wall_ms) >= self.cfg.max_holding_hours {
             return Some(ExitReason::MaxHoldingReached);
         }
 
+        // 2. データ欠損。レート差の消滅とは原因が違うので理由を分ける
+        if !Self::funding_data_available(position, ctx) {
+            return Some(ExitReason::FundingDataUnavailable);
+        }
+
         match Self::spread_in_position_direction(position, ctx) {
-            // 1. 反転・消滅（レート差そのものが無い場合も含む）
+            // 3. 反転・消滅 → breakeven 未達でも即降りる
             None => Some(ExitReason::FundingEdgeGone),
             Some(spread) => {
-                // 2. 建てる基準を割った = 保有し続ける理由が弱い
-                (spread.rate_diff_bps < self.cfg.min_rate_diff_bps)
+                // 4a. 手数料が未回収の間は、向きが同じなら保有を続ける。
+                //     ここで降りると払った手数料がそのまま損になる。
+                if position.funding_intervals_collected < position.breakeven_intervals {
+                    return None;
+                }
+                // 4b. 回収後は、エントリーより低い独立した閾値で判定する
+                (spread.rate_diff_bps < self.cfg.exit_rate_diff_bps)
                     .then_some(ExitReason::FundingBelowCost)
             }
         }
@@ -295,6 +368,9 @@ mod tests {
     fn config() -> FundingArbConfig {
         FundingArbConfig {
             min_rate_diff_bps: dec!(1),
+            // エントリーより低い独立した閾値（ヒステリシス帯 = 0.3〜1.0bps）
+            exit_rate_diff_bps: dec!(0.3),
+            max_staleness_delta_ms: 1_000,
             min_profit_bps: dec!(0.5),
             safety_buffer_bps: dec!(0.5),
             expected_intervals: 12,
@@ -306,7 +382,17 @@ mod tests {
         }
     }
 
+    /// breakeven 2 回のポジション（`emits_signal_when_rate_diff_covers_fees` と
+    /// 同じ数値。1 時間精算なので保有時間 = 回収済み精算回数）。
     fn position(hours_held: u64) -> OpenPosition {
+        position_with(hours_held, hours_held as u32, 2)
+    }
+
+    fn position_with(
+        hours_held: u64,
+        intervals_collected: u32,
+        breakeven_intervals: u32,
+    ) -> OpenPosition {
         OpenPosition {
             strategy: StrategyKind::FundingArb,
             symbol: Symbol::Btc,
@@ -315,8 +401,9 @@ mod tests {
             notional: dec!(1000),
             entry_basis_bps: Decimal::ZERO,
             entry_rate_diff_bps: dec!(3),
+            breakeven_intervals,
             opened_at_wall_ms: NOW_MS - hours_held * 3_600_000,
-            funding_intervals_collected: hours_held as u32,
+            funding_intervals_collected: intervals_collected,
         }
     }
 
@@ -488,6 +575,55 @@ mod tests {
     }
 
     #[test]
+    fn stale_books_block_the_signal() {
+        // 片方の板だけが古いと、ベーシスのフィルタが実在しない価格差を見る
+        // ことになる。判定できない以上、安全側に倒してシグナルを出さない。
+        let books = BookStore::new();
+        books.update(book(Dex::Hyperliquid, dec!(60000)));
+
+        // Lighter の板を 1.5 秒古くする（max_staleness_delta_ms = 1000）
+        let mut stale = book(Dex::Lighter, dec!(60000));
+        stale.trace.received_wall_ms = NOW_MS - 1_500;
+        books.update(stale);
+
+        let funding = FundingStore::new();
+        funding.update(rate(Dex::Hyperliquid, dec!(0.0004), dec!(1)));
+        funding.update(rate(Dex::Lighter, dec!(0.0001), dec!(1)));
+
+        let mut fees = FeeSchedule::new();
+        for dex in [Dex::Hyperliquid, Dex::Lighter] {
+            fees.insert(
+                dex,
+                DexFees {
+                    taker_bps: dec!(2),
+                    maker_bps: dec!(1),
+                },
+            );
+        }
+        let f = Fixture {
+            books,
+            funding,
+            fees,
+            symbols: vec![Symbol::Btc],
+            pairs: vec![(Dex::Hyperliquid, Dex::Lighter)],
+        };
+
+        assert!(
+            FundingArbStrategy::new(config())
+                .evaluate(&f.ctx())
+                .is_empty(),
+            "鮮度差 1500ms > 閾値 1000ms"
+        );
+
+        // 閾値を緩めれば同じ市場状態でもシグナルが出る
+        let cfg = FundingArbConfig {
+            max_staleness_delta_ms: 2_000,
+            ..config()
+        };
+        assert_eq!(FundingArbStrategy::new(cfg).evaluate(&f.ctx()).len(), 1);
+    }
+
+    #[test]
     fn missing_fees_block_the_signal() {
         let mut f = Fixture::new(dec!(0.0004), dec!(0.0001), dec!(60000), dec!(60000));
         f.fees = FeeSchedule::new();
@@ -507,23 +643,73 @@ mod tests {
     }
 
     #[test]
-    fn exits_when_rate_diff_reverses() {
+    fn exits_when_rate_diff_reverses_even_before_breakeven() {
         let strategy = FundingArbStrategy::new(config());
         // 建てた時と逆（Lighter の方が高くなった）
         let f = Fixture::new(dec!(0.0001), dec!(0.0004), dec!(60000), dec!(60000));
+        // 回収 0 回でも即降りる。保有し続ける理由そのものが消えているため
         assert_eq!(
-            strategy.should_exit(&position(1), &f.ctx()),
+            strategy.should_exit(&position_with(1, 0, 2), &f.ctx()),
+            Some(ExitReason::FundingEdgeGone)
+        );
+        assert_eq!(
+            strategy.should_exit(&position_with(5, 5, 2), &f.ctx()),
             Some(ExitReason::FundingEdgeGone)
         );
     }
 
     #[test]
-    fn exits_when_rate_diff_falls_below_entry_bar() {
+    fn holds_through_thinning_until_fees_are_recovered() {
+        // 修正の核心。レート差 3bps・手数料 6bps（breakeven 2 回）で建てた後、
+        // 1 回精算した時点でレート差が細っても降りてはいけない。
+        // ここで降りると 収益 3bps − 手数料 6bps = −3bps の確定損になる。
         let strategy = FundingArbStrategy::new(config());
-        // 向きは同じだが 0.5bps しかない（min_rate_diff_bps = 1）
+        // 向きは同じだが 0.1bps しかない（exit_rate_diff_bps = 0.3 も下回る）
+        let f = Fixture::new(dec!(0.00011), dec!(0.0001), dec!(60000), dec!(60000));
+
+        assert_eq!(
+            strategy.should_exit(&position_with(1, 0, 2), &f.ctx()),
+            None,
+            "回収 0/2 回では降りない"
+        );
+        assert_eq!(
+            strategy.should_exit(&position_with(1, 1, 2), &f.ctx()),
+            None,
+            "回収 1/2 回でも降りない（手数料はサンクコスト）"
+        );
+        // 回収し終えて初めて exit 閾値で判定される
+        assert_eq!(
+            strategy.should_exit(&position_with(2, 2, 2), &f.ctx()),
+            Some(ExitReason::FundingBelowCost)
+        );
+    }
+
+    #[test]
+    fn hysteresis_band_does_not_trigger_an_exit() {
+        // レート差が exit(0.3) と entry(1.0) の間にあるとき、回収済みでも
+        // 降りない。ここで降りるとエントリー基準を跨ぐたびに建て直しを
+        // 繰り返し、往復 6bps の手数料を払い続けることになる。
+        let strategy = FundingArbStrategy::new(config());
+        // 0.5bps
         let f = Fixture::new(dec!(0.00015), dec!(0.0001), dec!(60000), dec!(60000));
         assert_eq!(
-            strategy.should_exit(&position(1), &f.ctx()),
+            strategy.should_exit(&position_with(5, 5, 2), &f.ctx()),
+            None
+        );
+
+        // エントリー側はこの水準では建てない（= 建て直しも起きない）
+        assert!(FundingArbStrategy::new(config())
+            .evaluate(&f.ctx())
+            .is_empty());
+    }
+
+    #[test]
+    fn exits_below_exit_threshold_after_breakeven() {
+        let strategy = FundingArbStrategy::new(config());
+        // 0.2bps → exit_rate_diff_bps(0.3) 未満
+        let f = Fixture::new(dec!(0.00012), dec!(0.0001), dec!(60000), dec!(60000));
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 3, 2), &f.ctx()),
             Some(ExitReason::FundingBelowCost)
         );
     }
@@ -548,15 +734,63 @@ mod tests {
     }
 
     #[test]
-    fn exits_when_rate_data_disappears() {
+    fn exits_when_rate_diff_vanishes() {
         let strategy = FundingArbStrategy::new(config());
         let f = Fixture::new(dec!(0.0004), dec!(0.0001), dec!(60000), dec!(60000));
-        // レートが同値になり差が消えた状態を作る
+        // レートが同値になり差が消えた状態を作る（データはある）
         f.funding
             .update(rate(Dex::Hyperliquid, dec!(0.0001), dec!(1)));
         assert_eq!(
-            strategy.should_exit(&position(1), &f.ctx()),
-            Some(ExitReason::FundingEdgeGone)
+            strategy.should_exit(&position_with(1, 0, 2), &f.ctx()),
+            Some(ExitReason::FundingEdgeGone),
+            "レート差の消滅は回収未達でも降りる"
+        );
+    }
+
+    #[test]
+    fn missing_funding_data_is_distinguished_from_a_vanished_edge() {
+        // データ欠損は DEX の API 不調・WS 切断を示唆する。レート差の消滅とは
+        // 原因が違うので、リスク管理層が区別できるよう別の理由にする。
+        let strategy = FundingArbStrategy::new(config());
+        let books = BookStore::new();
+        books.update(book(Dex::Hyperliquid, dec!(60000)));
+        books.update(book(Dex::Lighter, dec!(60000)));
+
+        // Lighter のレートだけ受信できている状態
+        let funding = FundingStore::new();
+        funding.update(rate(Dex::Lighter, dec!(0.0001), dec!(1)));
+
+        let mut fees = FeeSchedule::new();
+        for dex in [Dex::Hyperliquid, Dex::Lighter] {
+            fees.insert(
+                dex,
+                DexFees {
+                    taker_bps: dec!(2),
+                    maker_bps: dec!(1),
+                },
+            );
+        }
+        let f = Fixture {
+            books,
+            funding,
+            fees,
+            symbols: vec![Symbol::Btc],
+            pairs: vec![(Dex::Hyperliquid, Dex::Lighter)],
+        };
+
+        assert_eq!(
+            strategy.should_exit(&position_with(1, 5, 2), &f.ctx()),
+            Some(ExitReason::FundingDataUnavailable)
+        );
+
+        // 両方とも取れていない場合も同じ
+        let empty = Fixture {
+            funding: FundingStore::new(),
+            ..f
+        };
+        assert_eq!(
+            strategy.should_exit(&position_with(1, 5, 2), &empty.ctx()),
+            Some(ExitReason::FundingDataUnavailable)
         );
     }
 

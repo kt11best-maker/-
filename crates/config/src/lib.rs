@@ -124,9 +124,24 @@ pub struct PriceArbConfig {
 pub struct FundingArbConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// これ未満のレート差（bps/精算）はシグナルを出さない。
+    /// これ未満のレート差（bps/精算）はシグナルを出さない（**エントリー基準**）。
     #[serde(default = "default_funding_min_rate_diff_bps")]
     pub min_rate_diff_bps: Decimal,
+    /// 手数料を回収し終えた後、これを下回ったら解消する（**エグジット基準**）。
+    ///
+    /// **`min_rate_diff_bps` より低くすること**（起動時に検証する）。
+    /// エントリーとエグジットに同じ閾値を使うと、レート差が閾値付近で振動した
+    /// ときに建て直しを繰り返し、往復のたびに 4 レグ分の手数料を払うことになる。
+    /// この 2 つの差がヒステリシス帯になる。
+    #[serde(default = "default_funding_exit_rate_diff_bps")]
+    pub exit_rate_diff_bps: Decimal,
+    /// ベーシス判定に使う板の鮮度差の上限（ms）。
+    ///
+    /// 片方の板だけが古いと、実在しない不利ベーシスで機会を逃すか、実在する
+    /// 不利ベーシスを見逃す。速度要求が低いので `price_arb` より緩くてよいが、
+    /// 無制限にはしない。
+    #[serde(default = "default_funding_max_staleness_ms")]
+    pub max_staleness_delta_ms: i64,
     /// 1 精算あたりの純収益がこれを下回るシグナルは出さない（bps）。
     #[serde(default = "default_funding_min_profit_bps")]
     pub min_profit_bps: Decimal,
@@ -599,6 +614,26 @@ impl Config {
                 "strategy.funding_arb.max_concurrent_positions は 1 以上".into(),
             ));
         }
+        // エグジット基準がエントリー基準以上だと、閾値付近でレート差が振動した
+        // ときに建て直しを繰り返し、往復のたびに 4 レグ分の手数料を払う。
+        if self.strategy.funding_arb.enabled
+            && self.strategy.funding_arb.exit_rate_diff_bps
+                > self.strategy.funding_arb.min_rate_diff_bps
+        {
+            return Err(ConfigError::Invalid(format!(
+                "strategy.funding_arb.exit_rate_diff_bps ({}) は min_rate_diff_bps ({}) 以下に\
+                 してください（エグジット基準をエントリー基準より低くしないと、閾値付近で\
+                 建て直しを繰り返します）",
+                self.strategy.funding_arb.exit_rate_diff_bps,
+                self.strategy.funding_arb.min_rate_diff_bps
+            )));
+        }
+        if self.strategy.funding_arb.enabled && self.strategy.funding_arb.max_staleness_delta_ms < 0
+        {
+            return Err(ConfigError::Invalid(
+                "strategy.funding_arb.max_staleness_delta_ms は 0 以上".into(),
+            ));
+        }
         for (dex, symbols) in Dex::ALL
             .iter()
             .filter(|d| self.is_enabled(**d))
@@ -918,6 +953,12 @@ fn default_price_arb_slippage_bps() -> Decimal {
 fn default_funding_min_rate_diff_bps() -> Decimal {
     Decimal::ONE
 }
+fn default_funding_exit_rate_diff_bps() -> Decimal {
+    Decimal::new(3, 1)
+}
+fn default_funding_max_staleness_ms() -> i64 {
+    1_000
+}
 fn default_funding_min_profit_bps() -> Decimal {
     Decimal::new(5, 1)
 }
@@ -1154,6 +1195,8 @@ impl Default for FundingArbConfig {
         FundingArbConfig {
             enabled: true,
             min_rate_diff_bps: default_funding_min_rate_diff_bps(),
+            exit_rate_diff_bps: default_funding_exit_rate_diff_bps(),
+            max_staleness_delta_ms: default_funding_max_staleness_ms(),
             min_profit_bps: default_funding_min_profit_bps(),
             safety_buffer_bps: default_funding_buffer_bps(),
             expected_intervals: default_funding_expected_intervals(),
@@ -1437,6 +1480,28 @@ excluded_symbols = ["HYPE"]
         let mut cfg = Config::default();
         cfg.dex.aster.excluded_symbols = Symbol::ALL.to_vec();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_exit_threshold_above_entry_threshold() {
+        // エグジット基準がエントリー基準より高いと、閾値付近でレート差が
+        // 振動するたびに建て直しを繰り返す
+        let mut cfg = Config::default();
+        cfg.strategy.funding_arb.min_rate_diff_bps = Decimal::ONE;
+        cfg.strategy.funding_arb.exit_rate_diff_bps = Decimal::TWO;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("exit_rate_diff_bps"), "{err}");
+
+        // 同値は許容する（ヒステリシス無しだが設定としては成立する）
+        cfg.strategy.funding_arb.exit_rate_diff_bps = Decimal::ONE;
+        cfg.validate().unwrap();
+
+        // 既定はエントリーより低い
+        let cfg = Config::default();
+        assert!(
+            cfg.strategy.funding_arb.exit_rate_diff_bps
+                < cfg.strategy.funding_arb.min_rate_diff_bps
+        );
     }
 
     #[test]

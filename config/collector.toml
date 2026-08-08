@@ -178,8 +178,15 @@ exit_style = "taker"
 
 [strategy.funding_arb]
 enabled = true
-# 1 精算あたりのレート差がこれ未満ならシグナルを出さない
+# 1 精算あたりのレート差がこれ未満ならシグナルを出さない（エントリー基準）
 min_rate_diff_bps = 1.0
+# 手数料を回収し終えた後、これを下回ったら解消する（エグジット基準）。
+# min_rate_diff_bps より低くすること（起動時に検証する）。
+# この 2 つの差がヒステリシス帯になり、閾値付近での建て直しを防ぐ。
+exit_rate_diff_bps = 0.3
+# ベーシス判定に使う板の鮮度差の上限。
+# price_arb（250ms）より緩くてよいが、無制限にはしない。
+max_staleness_delta_ms = 1000
 # 1 精算あたりの純収益の下限
 min_profit_bps = 0.5
 safety_buffer_bps = 0.5

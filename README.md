@@ -141,6 +141,42 @@ perp-arb-bot/
   （`breakeven_intervals`）、`max_acceptable_breakeven_intervals` を超えたら棄却する。
 - 精算間隔が異なる DEX 同士は既定で扱わない（1 精算あたりの比較が成立しないため）。
   扱う場合は年率換算（`FundingRate::annualized_bps`）で正規化する。
+- 板の鮮度差が `max_staleness_delta_ms`（既定 1000ms）を超えるペアは、ベーシスの
+  フィルタが効かないので**シグナルを出さない**。速度要求が低いので `price_arb`
+  （250ms）より緩いが、無制限にはしない。
+
+#### エントリーとエグジットは同じ基準で判断しない
+
+エントリーは手数料を `expected_intervals` で按分して採算を見る。つまり
+**「その回数だけ精算をまたぐ」前提で建てている**。にもかかわらずエントリー基準
+（`min_rate_diff_bps`）を割った瞬間に降りると、**手数料を回収し切る前に確定損を
+出す**。
+
+> レート差 3bps/精算・手数料 6bps（breakeven 2 回）で建て、1 回精算した時点で
+> レート差が 0.9bps に細って降りた場合:
+> 収益 3bps − 手数料 6bps = **−3bps の確定損**
+
+**すでに払った手数料はサンクコスト**なので、降りる判断は「エントリー基準を割ったか」
+ではなく「今後の期待収益 vs 今降りるコスト」で行う。`should_exit` は 4 系統:
+
+| 状況 | 判定 |
+|---|---|
+| 最大保有期間に到達 | `MaxHoldingReached`（レートが見えなくても効く） |
+| データ欠損 | `FundingDataUnavailable` |
+| **反転**（保有と逆向き / レート差消滅） | `FundingEdgeGone`。**breakeven 未達でも即降りる** |
+| **細っただけ** | breakeven 回収までは保有継続。回収後に `exit_rate_diff_bps` を下回ったら `FundingBelowCost` |
+
+`min_rate_diff_bps`（エントリー）と `exit_rate_diff_bps`（エグジット）の差が
+**ヒステリシス帯**になり、閾値付近でレート差が振動しても建て直しを繰り返さない。
+`exit_rate_diff_bps > min_rate_diff_bps` は起動時に設定エラーとして弾く。
+
+`OpenPosition::funding_intervals_collected` は**執行レイヤーが精算のたびに
+インクリメントする**（`next_funding_time_ms` を跨いだことを検知して増やす）。
+ここが更新されないと breakeven の判定が永久に成立せず、`max_holding_hours` まで
+降りられなくなる。フェーズ2 のドライラン評価でも同じロジックを使うこと。
+
+`FundingDataUnavailable` はレート差の消滅とは原因が違う（DEX の API 不調・WS 切断の
+疑い）。リスク管理層が「データが取れていない」ことを検知できるよう区別している。
 
 > **`expected_profit_bps` の意味が戦略で違う。** 価格差は「1 往復の純利益」、
 > ファンディングは「**1 精算あたり**の純収益」。同じ土俵で比較してはいけない。
@@ -307,6 +343,9 @@ DEX によってファンディングの精算間隔が異なる（1 時間ご�
 | `dex.lighter.use_testnet` | false | testnet に切り替える |
 | `dex.*.excluded_symbols` | `[]` | その DEX で購読しない銘柄 |
 | `strategy.price_arb.max_staleness_delta_ms` | 250 | 鮮度差がこれを超えるペアは判定しない |
+| `strategy.funding_arb.min_rate_diff_bps` | 1.0 | エントリー基準（bps/精算） |
+| `strategy.funding_arb.exit_rate_diff_bps` | 0.3 | エグジット基準。**エントリーより低くする** |
+| `strategy.funding_arb.max_staleness_delta_ms` | 1000 | ベーシス判定に使う板の鮮度差の上限 |
 | `strategy.funding_arb.max_adverse_basis_bps` | 2.0 | これ以上不利なベーシスでは建てない |
 | `strategy.funding_arb.count_favorable_basis` | false | 有利なベーシスを利益に加算するか |
 | `strategy.funding_arb.max_holding_hours` | 72 | 最大保有時間 |
@@ -454,7 +493,7 @@ edgeX（アプリ層 JSON）と dYdX（プロトコル制御フレーム）は�
 ## テスト
 
 ```bash
-cargo test --workspace     # 292 tests
+cargo test --workspace     # 297 tests
 cargo clippy --workspace --all-targets
 ```
 
@@ -479,7 +518,9 @@ cargo clippy --workspace --all-targets
 - `strategy-price-arb`: 手数料超え判定、鮮度差フィルタ、VWAP/best 気配の切替、
   板が薄い場合、手数料未設定時のスキップ、収束時の手仕舞い
 - `strategy-funding-arb`: 手数料回収回数、不利ベーシスの棄却、有利ベーシスを
-  既定で加算しないこと、精算間隔不一致の扱い、レート反転・保有上限での手仕舞い
+  既定で加算しないこと、精算間隔不一致の扱い、板の鮮度差による棄却、
+  **breakeven 未達では細っても降りないこと**、反転は未達でも降りること、
+  ヒステリシス帯で降りないこと、データ欠損と差の消滅の区別
 - `risk`: 戦略枠の分離、枠超過の縮小承認、緊急クローズ余力の侵食検知、
   戦略別キルスイッチと全体停止の優先関係
 - `bin/collector`: 生 JSON → 価格差計算 → CSV 1 行までの統合テスト

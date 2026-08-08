@@ -466,6 +466,8 @@ mod tests {
             notional: dec!(1000),
             entry_basis_bps: dec!(100),
             entry_rate_diff_bps: Decimal::ZERO,
+            // 価格差アービトラージでは使わない（ファンディング裁定専用）
+            breakeven_intervals: 0,
             opened_at_wall_ms: 1_700_000_000_000,
             funding_intervals_collected: 0,
         };
@@ -494,6 +496,7 @@ mod tests {
             notional: dec!(1000),
             entry_basis_bps: Decimal::ZERO,
             entry_rate_diff_bps: dec!(2),
+            breakeven_intervals: 2,
             opened_at_wall_ms: 1_700_000_000_000,
             funding_intervals_collected: 0,
         };

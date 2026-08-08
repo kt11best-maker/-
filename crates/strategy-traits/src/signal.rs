@@ -140,8 +140,22 @@ pub struct OpenPosition {
     pub entry_basis_bps: Decimal,
     /// 建てた時点で見込んだ 1 精算あたりのレート差（bps）。
     pub entry_rate_diff_bps: Decimal,
+    /// **エントリー時に算出した、手数料回収に必要な精算回数。**
+    ///
+    /// エグジット判定で参照する。建てた時点で払った手数料はサンクコストなので、
+    /// この回数を回収するまでは「エントリー基準を割ったか」ではなく
+    /// 「回収が済んだか」で降りるかを決める。
+    ///
+    /// 建てる際は [`SignalRationale::FundingArb::breakeven_intervals`] から
+    /// そのまま引き継ぐこと。
+    pub breakeven_intervals: u32,
     pub opened_at_wall_ms: u64,
     /// これまでに跨いだ精算回数。
+    ///
+    /// **精算のたびにインクリメントする責任は執行レイヤーにある。**
+    /// 精算時刻（`FundingRate::next_funding_time_ms`）を跨いだことを検知して
+    /// 増やすこと。ここが更新されないと breakeven の判定が永久に成立せず、
+    /// `max_holding_hours` まで降りられなくなる。
     pub funding_intervals_collected: u32,
 }
 
@@ -160,6 +174,12 @@ pub enum ExitReason {
     FundingEdgeGone,
     /// レート差が決済コストを下回った。
     FundingBelowCost,
+    /// **ファンディングデータ自体が取得できていない。**
+    ///
+    /// レート差の消滅（[`ExitReason::FundingEdgeGone`]）とは原因が違う。
+    /// こちらは DEX の API 不調や WS 切断を示唆するため、リスク管理層が
+    /// 「データが取れていない」ことを検知できるよう区別する。
+    FundingDataUnavailable,
     /// 価格差が目標まで収束した（価格差アービトラージの利確）。
     SpreadConverged,
     /// 最大保有期間に到達。
@@ -175,6 +195,7 @@ impl ExitReason {
         match self {
             ExitReason::FundingEdgeGone => "funding_edge_gone",
             ExitReason::FundingBelowCost => "funding_below_cost",
+            ExitReason::FundingDataUnavailable => "funding_data_unavailable",
             ExitReason::SpreadConverged => "spread_converged",
             ExitReason::MaxHoldingReached => "max_holding_reached",
             ExitReason::MarginPressure => "margin_pressure",
@@ -252,6 +273,7 @@ mod tests {
             notional: dec!(1000),
             entry_basis_bps: dec!(1),
             entry_rate_diff_bps: dec!(2),
+            breakeven_intervals: 2,
             opened_at_wall_ms: 1_700_000_000_000,
             funding_intervals_collected: 3,
         };
