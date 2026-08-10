@@ -39,7 +39,7 @@ use strategy_traits::{
     ExitReason, MarketContext, OpenPosition, SignalRationale, Strategy, StrategyKind, TradeSignal,
     Urgency,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub struct FundingArbStrategy {
     cfg: FundingArbConfig,
@@ -185,6 +185,169 @@ impl FundingArbStrategy {
                 .get(position.short_dex, position.symbol)
                 .is_some()
     }
+
+    /// このポジションの精算間隔（時間）。
+    ///
+    /// 両 DEX で異なる場合は**長い方**を使う。両方の精算を跨がないとレート差を
+    /// 完全には取れないため、短い方で数えると回収したつもりで回収できていない。
+    /// どちらも不明なら `None`。
+    fn position_interval_hours(
+        position: &OpenPosition,
+        ctx: &MarketContext<'_>,
+    ) -> Option<Decimal> {
+        let long = ctx
+            .funding
+            .get(position.long_dex, position.symbol)
+            .and_then(|r| r.interval_hours);
+        let short = ctx
+            .funding
+            .get(position.short_dex, position.symbol)
+            .and_then(|r| r.interval_hours);
+        match (long, short) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        }
+    }
+
+    /// 手数料を回収し終えたか。
+    ///
+    /// 回収回数は**時刻から導出する**（[`OpenPosition::intervals_collected`]）。
+    /// 執行レイヤーがフィールドを更新してくれる前提にすると、更新漏れで
+    /// 「回収 0 回のまま `max_holding_hours` まで抱え続ける」事故が静かに起きる。
+    ///
+    /// 精算間隔が不明な場合は回数を数えられないので `true`（= 回収済み扱い）を
+    /// 返す。検証できない前提で無期限に持ち続ける方が危険なため。
+    fn fees_recovered(&self, position: &OpenPosition, ctx: &MarketContext<'_>) -> bool {
+        let Some(interval_hours) = Self::position_interval_hours(position, ctx) else {
+            debug!(
+                strategy = %StrategyKind::FundingArb,
+                symbol = %position.symbol,
+                "精算間隔が不明なため回収回数を数えられません。回収済みとして扱います"
+            );
+            return true;
+        };
+
+        let derived = position.intervals_collected(ctx.now_wall_ms, interval_hours);
+        Self::warn_on_interval_mismatch(position, derived);
+        derived >= position.breakeven_intervals
+    }
+
+    /// 導出値と執行レイヤーの観測値が乖離していたら警告する。
+    ///
+    /// 精算の検知漏れかレートデータの異常を示唆する。差が 1 以内なら精算
+    /// タイミングの境界による誤差として許容する。
+    fn warn_on_interval_mismatch(position: &OpenPosition, derived: u32) {
+        if position.observed_intervals_collected == 0 {
+            // 執行レイヤーがまだ観測を入れていない（フェーズ1〜2）
+            return;
+        }
+        if derived.abs_diff(position.observed_intervals_collected) > 1 {
+            warn!(
+                strategy = %StrategyKind::FundingArb,
+                symbol = %position.symbol,
+                derived,
+                observed = position.observed_intervals_collected,
+                "精算回数の導出値と観測値が乖離している"
+            );
+        }
+    }
+
+    /// ベーシスが不利な間、このエグジットを保留してよいか。
+    ///
+    /// | 理由 | 緊急度 | 保留 |
+    /// |---|---|---|
+    /// | [`ExitReason::FundingEdgeGone`]（反転） | 高 | 不可。保有理由が消えている |
+    /// | [`ExitReason::FundingDataUnavailable`] | 高 | 不可。API 不調の疑いがあり状況が悪化しうる |
+    /// | [`ExitReason::MaxHoldingReached`] | 中 | 可（保留上限つき） |
+    /// | [`ExitReason::FundingBelowCost`] | 低 | 可。有利なベーシスを待つ価値がある |
+    ///
+    /// リスク管理層由来（証拠金・キルスイッチ）はそもそもここの管轄外。
+    fn is_deferrable(reason: ExitReason) -> bool {
+        matches!(
+            reason,
+            ExitReason::FundingBelowCost | ExitReason::MaxHoldingReached
+        )
+    }
+
+    /// ベーシス・保留上限を考慮しない素のエグジット理由。
+    fn raw_exit_reason(
+        &self,
+        position: &OpenPosition,
+        ctx: &MarketContext<'_>,
+    ) -> Option<ExitReason> {
+        // 1. 最大保有期間（レートが見えなくても効かせたいので最初に見る）
+        if position.holding_hours(ctx.now_wall_ms) >= self.cfg.max_holding_hours {
+            return Some(ExitReason::MaxHoldingReached);
+        }
+
+        // 2. データ欠損。レート差の消滅とは原因が違うので理由を分ける
+        if !Self::funding_data_available(position, ctx) {
+            return Some(ExitReason::FundingDataUnavailable);
+        }
+
+        match Self::spread_in_position_direction(position, ctx) {
+            // 3. 反転・消滅 → breakeven 未達でも即降りる
+            None => Some(ExitReason::FundingEdgeGone),
+            Some(spread) => {
+                // 4a. 手数料が未回収の間は、向きが同じなら保有を続ける。
+                //     ここで降りると払った手数料がそのまま損になる。
+                if !self.fees_recovered(position, ctx) {
+                    return None;
+                }
+                // 4b. 回収後は、エントリーより低い独立した閾値で判定する
+                (spread.rate_diff_bps < self.cfg.exit_rate_diff_bps)
+                    .then_some(ExitReason::FundingBelowCost)
+            }
+        }
+    }
+
+    /// 決済方向のベーシスが不利すぎるので保留すべきか。
+    ///
+    /// **鮮度が判定できない場合は保留しない。** エントリーとは安全側の向きが
+    /// 逆である点に注意: エントリーは「判定できないなら建てない」が安全だが、
+    /// エグジットは「判定できないなら待たない」が安全（不確かなデータを根拠に
+    /// 持ち続ける方が危険）。
+    fn should_defer_exit(
+        &self,
+        position: &OpenPosition,
+        ctx: &MarketContext<'_>,
+        reason: ExitReason,
+    ) -> bool {
+        // 保留の上限を超えていたら、ベーシスがどうあれ降りる
+        if position.exit_deferred_hours(ctx.now_wall_ms) >= self.cfg.max_exit_deferral_hours {
+            return false;
+        }
+
+        // 鮮度が判定できない（板が揃っていない）なら保留しない
+        let Some(delta) =
+            ctx.staleness_delta_ms(position.symbol, position.long_dex, position.short_dex)
+        else {
+            return false;
+        };
+        if delta.abs() > self.cfg.max_staleness_delta_ms {
+            return false;
+        }
+
+        // 板は揃っているが mid が取れない（片側だけの板）なら保留しない
+        let Some(exit_basis_bps) = ctx.signed_exit_basis_bps(position) else {
+            return false;
+        };
+        if exit_basis_bps >= -self.cfg.max_adverse_exit_basis_bps {
+            return false;
+        }
+
+        debug!(
+            strategy = %StrategyKind::FundingArb,
+            symbol = %position.symbol,
+            reason = reason.as_str(),
+            exit_basis_bps = %exit_basis_bps,
+            threshold_bps = %self.cfg.max_adverse_exit_basis_bps,
+            deferred_hours = %position.exit_deferred_hours(ctx.now_wall_ms),
+            "決済方向のベーシスが不利なためエグジットを保留"
+        );
+        true
+    }
 }
 
 impl Strategy for FundingArbStrategy {
@@ -238,36 +401,37 @@ impl Strategy for FundingArbStrategy {
     /// `min_rate_diff_bps` と `exit_rate_diff_bps` の差がヒステリシス帯になり、
     /// 閾値付近でレート差が振動しても建て直しを繰り返さない。
     ///
+    /// 回収回数は**時刻から導出する**。執行レイヤーがフィールドを更新して
+    /// くれる前提にすると、更新漏れで「回収 0 回のまま `max_holding_hours` まで
+    /// 抱え続ける」事故が静かに起きるため。
+    ///
+    /// # ベーシスによる保留
+    ///
+    /// 緊急性の低いエグジット（`FundingBelowCost` / `MaxHoldingReached`）は、
+    /// **決済方向のベーシスが不利な間は保留**する。ファンディング裁定は
+    /// [`Urgency::Patient`] なのだから、「レート差は細ったが今はベーシスが
+    /// 不利なので有利に戻るまで待つ」という選択ができる。反転・データ欠損は
+    /// 緊急性が高いので保留しない。
+    ///
+    /// 保留状態（`exit_deferred_since_ms`）の更新は呼び出し側の責務。ここは
+    /// `&self` しか持たないので判定のみを行う。
+    ///
     /// 証拠金維持率の悪化とキルスイッチはリスク管理層の担当で、ここでは見ない。
     fn should_exit(&self, position: &OpenPosition, ctx: &MarketContext<'_>) -> Option<ExitReason> {
         if position.strategy != StrategyKind::FundingArb {
             return None;
         }
 
-        // 1. 最大保有期間（レートが見えなくても効かせたいので最初に見る）
-        if position.holding_hours(ctx.now_wall_ms) >= self.cfg.max_holding_hours {
-            return Some(ExitReason::MaxHoldingReached);
-        }
+        let reason = self.raw_exit_reason(position, ctx)?;
 
-        // 2. データ欠損。レート差の消滅とは原因が違うので理由を分ける
-        if !Self::funding_data_available(position, ctx) {
-            return Some(ExitReason::FundingDataUnavailable);
+        // 緊急度が高い理由はベーシスを見ずに即降りる
+        if !Self::is_deferrable(reason) {
+            return Some(reason);
         }
-
-        match Self::spread_in_position_direction(position, ctx) {
-            // 3. 反転・消滅 → breakeven 未達でも即降りる
-            None => Some(ExitReason::FundingEdgeGone),
-            Some(spread) => {
-                // 4a. 手数料が未回収の間は、向きが同じなら保有を続ける。
-                //     ここで降りると払った手数料がそのまま損になる。
-                if position.funding_intervals_collected < position.breakeven_intervals {
-                    return None;
-                }
-                // 4b. 回収後は、エントリーより低い独立した閾値で判定する
-                (spread.rate_diff_bps < self.cfg.exit_rate_diff_bps)
-                    .then_some(ExitReason::FundingBelowCost)
-            }
+        if self.should_defer_exit(position, ctx, reason) {
+            return None;
         }
+        Some(reason)
     }
 }
 
@@ -383,16 +547,20 @@ mod tests {
     }
 
     /// breakeven 2 回のポジション（`emits_signal_when_rate_diff_covers_fees` と
-    /// 同じ数値。1 時間精算なので保有時間 = 回収済み精算回数）。
+    /// 同じ数値）。
+    ///
+    /// 1 時間精算・エントリーの 1 時間後が初回精算なので、
+    /// **保有時間（時間）= 回収済み精算回数**になる。
     fn position(hours_held: u64) -> OpenPosition {
-        position_with(hours_held, hours_held as u32, 2)
+        position_with(hours_held, 2)
     }
 
-    fn position_with(
-        hours_held: u64,
-        intervals_collected: u32,
-        breakeven_intervals: u32,
-    ) -> OpenPosition {
+    /// `hours_held` 時間前に建てたポジション。
+    ///
+    /// **回収回数はフィールドで渡さない**（時刻から導出される）。ここが
+    /// 修正の要点で、執行レイヤーの更新漏れで判定が壊れないようにしている。
+    fn position_with(hours_held: u64, breakeven_intervals: u32) -> OpenPosition {
+        let opened_at_wall_ms = NOW_MS - hours_held * 3_600_000;
         OpenPosition {
             strategy: StrategyKind::FundingArb,
             symbol: Symbol::Btc,
@@ -402,8 +570,11 @@ mod tests {
             entry_basis_bps: Decimal::ZERO,
             entry_rate_diff_bps: dec!(3),
             breakeven_intervals,
-            opened_at_wall_ms: NOW_MS - hours_held * 3_600_000,
-            funding_intervals_collected: intervals_collected,
+            opened_at_wall_ms,
+            // 建てた 1 時間後が初回精算
+            entry_next_funding_time_ms: Some(opened_at_wall_ms + 3_600_000),
+            observed_intervals_collected: 0,
+            exit_deferred_since_ms: None,
         }
     }
 
@@ -649,11 +820,11 @@ mod tests {
         let f = Fixture::new(dec!(0.0001), dec!(0.0004), dec!(60000), dec!(60000));
         // 回収 0 回でも即降りる。保有し続ける理由そのものが消えているため
         assert_eq!(
-            strategy.should_exit(&position_with(1, 0, 2), &f.ctx()),
+            strategy.should_exit(&position_with(0, 2), &f.ctx()),
             Some(ExitReason::FundingEdgeGone)
         );
         assert_eq!(
-            strategy.should_exit(&position_with(5, 5, 2), &f.ctx()),
+            strategy.should_exit(&position_with(5, 2), &f.ctx()),
             Some(ExitReason::FundingEdgeGone)
         );
     }
@@ -668,18 +839,115 @@ mod tests {
         let f = Fixture::new(dec!(0.00011), dec!(0.0001), dec!(60000), dec!(60000));
 
         assert_eq!(
-            strategy.should_exit(&position_with(1, 0, 2), &f.ctx()),
+            strategy.should_exit(&position_with(0, 2), &f.ctx()),
             None,
             "回収 0/2 回では降りない"
         );
         assert_eq!(
-            strategy.should_exit(&position_with(1, 1, 2), &f.ctx()),
+            strategy.should_exit(&position_with(1, 2), &f.ctx()),
             None,
             "回収 1/2 回でも降りない（手数料はサンクコスト）"
         );
         // 回収し終えて初めて exit 閾値で判定される
         assert_eq!(
-            strategy.should_exit(&position_with(2, 2, 2), &f.ctx()),
+            strategy.should_exit(&position_with(2, 2), &f.ctx()),
+            Some(ExitReason::FundingBelowCost)
+        );
+    }
+
+    #[test]
+    fn recovery_is_derived_from_time_not_from_a_tracked_field() {
+        // 修正4 の回帰テスト。observed_intervals_collected を誰も更新しなくても、
+        // 時間経過だけで FundingBelowCost に到達すること。
+        // フィールド追跡に頼ると「更新漏れ → 常に 0 → max_holding_hours まで
+        // 抱え続ける」という機能不全が静かに起きる。
+        let strategy = FundingArbStrategy::new(config());
+        let f = Fixture::new(dec!(0.00011), dec!(0.0001), dec!(60000), dec!(60000));
+
+        let mut p = position_with(3, 2);
+        p.observed_intervals_collected = 0; // 執行レイヤーが一度も更新していない
+        assert_eq!(
+            strategy.should_exit(&p, &f.ctx()),
+            Some(ExitReason::FundingBelowCost),
+            "フィールドが 0 のままでも時間経過で回収済みと判断される"
+        );
+    }
+
+    #[test]
+    fn intervals_are_counted_from_the_first_settlement_time() {
+        let hourly = dec!(1);
+        // NOW の 90 分前に建て、初回精算は建てた 30 分後（= NOW の 60 分前）
+        let mut p = position_with(0, 2);
+        p.opened_at_wall_ms = NOW_MS - 90 * 60_000;
+        p.entry_next_funding_time_ms = Some(NOW_MS - 60 * 60_000);
+
+        // 初回精算の直前は 0
+        assert_eq!(
+            p.intervals_collected(NOW_MS - 61 * 60_000, hourly),
+            0,
+            "跨ぐ前は 0（エントリー直後に breakeven 判定が通ってはいけない）"
+        );
+        // 跨いだ瞬間に 1
+        assert_eq!(p.intervals_collected(NOW_MS - 60 * 60_000, hourly), 1);
+        // さらに 1 時間で 2
+        assert_eq!(p.intervals_collected(NOW_MS, hourly), 2);
+    }
+
+    #[test]
+    fn intervals_fall_back_to_elapsed_time_when_first_settlement_is_unknown() {
+        let hourly = dec!(1);
+        let mut p = position_with(0, 2);
+        p.opened_at_wall_ms = NOW_MS - 150 * 60_000; // 2.5 時間前
+        p.entry_next_funding_time_ms = None;
+
+        // 経過時間からの近似。最初の 1 回を過大評価しないよう切り捨てる
+        assert_eq!(p.intervals_collected(NOW_MS, hourly), 2);
+        assert_eq!(p.intervals_collected(p.opened_at_wall_ms, hourly), 0);
+        // 精算間隔が不明・非正なら数えられない
+        assert_eq!(p.intervals_collected(NOW_MS, Decimal::ZERO), 0);
+    }
+
+    #[test]
+    fn longer_interval_is_used_when_the_two_dexes_differ() {
+        // 両方の精算を跨がないとレート差を完全には取れない。短い方で数えると
+        // 回収したつもりで回収できていない。
+        let books = BookStore::new();
+        books.update(book(Dex::Hyperliquid, dec!(60000)));
+        books.update(book(Dex::Lighter, dec!(60000)));
+
+        let funding = FundingStore::new();
+        // HL は 1 時間、Lighter は 4 時間精算
+        funding.update(rate(Dex::Hyperliquid, dec!(0.00011), dec!(1)));
+        funding.update(rate(Dex::Lighter, dec!(0.0001), dec!(4)));
+
+        let mut fees = FeeSchedule::new();
+        for dex in [Dex::Hyperliquid, Dex::Lighter] {
+            fees.insert(
+                dex,
+                DexFees {
+                    taker_bps: dec!(2),
+                    maker_bps: dec!(1),
+                },
+            );
+        }
+        let f = Fixture {
+            books,
+            funding,
+            fees,
+            symbols: vec![Symbol::Btc],
+            pairs: vec![(Dex::Hyperliquid, Dex::Lighter)],
+        };
+        let strategy = FundingArbStrategy::new(config());
+
+        // 3 時間保有。1 時間精算なら 3 回だが、4 時間側では 0 回
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 2), &f.ctx()),
+            None,
+            "長い方（4 時間）で数えるのでまだ回収できていない"
+        );
+        // 9 時間なら 4 時間精算でも 2 回跨いでいる
+        assert_eq!(
+            strategy.should_exit(&position_with(9, 2), &f.ctx()),
             Some(ExitReason::FundingBelowCost)
         );
     }
@@ -692,10 +960,7 @@ mod tests {
         let strategy = FundingArbStrategy::new(config());
         // 0.5bps
         let f = Fixture::new(dec!(0.00015), dec!(0.0001), dec!(60000), dec!(60000));
-        assert_eq!(
-            strategy.should_exit(&position_with(5, 5, 2), &f.ctx()),
-            None
-        );
+        assert_eq!(strategy.should_exit(&position_with(5, 2), &f.ctx()), None);
 
         // エントリー側はこの水準では建てない（= 建て直しも起きない）
         assert!(FundingArbStrategy::new(config())
@@ -709,8 +974,138 @@ mod tests {
         // 0.2bps → exit_rate_diff_bps(0.3) 未満
         let f = Fixture::new(dec!(0.00012), dec!(0.0001), dec!(60000), dec!(60000));
         assert_eq!(
-            strategy.should_exit(&position_with(3, 3, 2), &f.ctx()),
+            strategy.should_exit(&position_with(3, 2), &f.ctx()),
             Some(ExitReason::FundingBelowCost)
+        );
+    }
+
+    /// 決済方向のベーシスが不利な状態（ロング側 Lighter が安く、ショート側
+    /// Hyperliquid が高い）。決済すると約 5bps の損を確定させる。
+    fn adverse_exit_basis_fixture() -> Fixture {
+        // 0.2bps のレート差（exit 閾値 0.3 未満 → FundingBelowCost）
+        Fixture::new(dec!(0.00012), dec!(0.0001), dec!(60030), dec!(60000))
+    }
+
+    #[test]
+    fn defers_low_urgency_exit_while_the_exit_basis_is_adverse() {
+        let strategy = FundingArbStrategy::new(config());
+        let f = adverse_exit_basis_fixture();
+
+        // 決済方向のベーシスが -5bps（許容 3bps）なので保留する
+        let ctx = f.ctx();
+        assert!(ctx.signed_exit_basis_bps(&position_with(3, 2)).unwrap() < dec!(-3));
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 2), &ctx),
+            None,
+            "有利に戻るまで待つ（Urgency::Patient なので待てる）"
+        );
+
+        // ベーシスが許容範囲なら通常どおり降りる
+        let ok = Fixture::new(dec!(0.00012), dec!(0.0001), dec!(60000), dec!(60000));
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 2), &ok.ctx()),
+            Some(ExitReason::FundingBelowCost)
+        );
+    }
+
+    #[test]
+    fn deferral_has_an_upper_bound() {
+        let strategy = FundingArbStrategy::new(config());
+        let f = adverse_exit_basis_fixture();
+
+        // 保留を始めて 5 時間（上限 6 時間）→ まだ待つ
+        let mut p = position_with(3, 2);
+        p.exit_deferred_since_ms = Some(NOW_MS - 5 * 3_600_000);
+        assert_eq!(strategy.should_exit(&p, &f.ctx()), None);
+
+        // 6 時間経過 → ベーシスが不利でも降りる
+        p.exit_deferred_since_ms = Some(NOW_MS - 6 * 3_600_000);
+        assert_eq!(
+            strategy.should_exit(&p, &f.ctx()),
+            Some(ExitReason::FundingBelowCost)
+        );
+    }
+
+    #[test]
+    fn urgent_exits_are_never_deferred() {
+        let strategy = FundingArbStrategy::new(config());
+
+        // 反転: 決済ベーシスが不利でも即降りる
+        let reversed = Fixture::new(dec!(0.0001), dec!(0.0004), dec!(60030), dec!(60000));
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 2), &reversed.ctx()),
+            Some(ExitReason::FundingEdgeGone)
+        );
+
+        // データ欠損: API 不調の疑いがあり、待つと状況が悪化しうる
+        let f = adverse_exit_basis_fixture();
+        let missing = Fixture {
+            funding: FundingStore::new(),
+            ..f
+        };
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 2), &missing.ctx()),
+            Some(ExitReason::FundingDataUnavailable)
+        );
+    }
+
+    #[test]
+    fn stale_books_do_not_defer_the_exit() {
+        // エントリーとは安全側の向きが逆。エントリーは「判定できないなら
+        // 建てない」が安全だが、エグジットは「判定できないなら待たない」が安全
+        // （不確かなデータを根拠に持ち続ける方が危険）。
+        let strategy = FundingArbStrategy::new(config());
+
+        let books = BookStore::new();
+        books.update(book(Dex::Hyperliquid, dec!(60030)));
+        let mut stale = book(Dex::Lighter, dec!(60000));
+        stale.trace.received_wall_ms = NOW_MS - 1_500;
+        books.update(stale);
+
+        let funding = FundingStore::new();
+        funding.update(rate(Dex::Hyperliquid, dec!(0.00012), dec!(1)));
+        funding.update(rate(Dex::Lighter, dec!(0.0001), dec!(1)));
+
+        let mut fees = FeeSchedule::new();
+        for dex in [Dex::Hyperliquid, Dex::Lighter] {
+            fees.insert(
+                dex,
+                DexFees {
+                    taker_bps: dec!(2),
+                    maker_bps: dec!(1),
+                },
+            );
+        }
+        let f = Fixture {
+            books,
+            funding,
+            fees,
+            symbols: vec![Symbol::Btc],
+            pairs: vec![(Dex::Hyperliquid, Dex::Lighter)],
+        };
+
+        // ベーシスは不利だが、鮮度差 1500ms > 閾値 1000ms なので保留しない
+        assert_eq!(
+            strategy.should_exit(&position_with(3, 2), &f.ctx()),
+            Some(ExitReason::FundingBelowCost)
+        );
+    }
+
+    #[test]
+    fn max_holding_is_deferrable_but_bounded() {
+        let strategy = FundingArbStrategy::new(config());
+        let f = adverse_exit_basis_fixture();
+
+        // 保有上限に達していても、決済が不利なら短期間は待てる
+        assert_eq!(strategy.should_exit(&position_with(72, 2), &f.ctx()), None);
+
+        // 保留上限を超えたら降りる。実効的な最大保有は
+        // max_holding_hours + max_exit_deferral_hours になる
+        let mut p = position_with(72, 2);
+        p.exit_deferred_since_ms = Some(NOW_MS - 6 * 3_600_000);
+        assert_eq!(
+            strategy.should_exit(&p, &f.ctx()),
+            Some(ExitReason::MaxHoldingReached)
         );
     }
 
@@ -741,7 +1136,7 @@ mod tests {
         f.funding
             .update(rate(Dex::Hyperliquid, dec!(0.0001), dec!(1)));
         assert_eq!(
-            strategy.should_exit(&position_with(1, 0, 2), &f.ctx()),
+            strategy.should_exit(&position_with(1, 2), &f.ctx()),
             Some(ExitReason::FundingEdgeGone),
             "レート差の消滅は回収未達でも降りる"
         );
@@ -779,7 +1174,7 @@ mod tests {
         };
 
         assert_eq!(
-            strategy.should_exit(&position_with(1, 5, 2), &f.ctx()),
+            strategy.should_exit(&position_with(1, 2), &f.ctx()),
             Some(ExitReason::FundingDataUnavailable)
         );
 
@@ -789,7 +1184,7 @@ mod tests {
             ..f
         };
         assert_eq!(
-            strategy.should_exit(&position_with(1, 5, 2), &empty.ctx()),
+            strategy.should_exit(&position_with(1, 2), &empty.ctx()),
             Some(ExitReason::FundingDataUnavailable)
         );
     }

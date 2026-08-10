@@ -156,6 +156,21 @@ pub struct FundingArbConfig {
     /// これ以上不利なベーシスでは建てない（bps）。
     #[serde(default = "default_funding_max_adverse_basis_bps")]
     pub max_adverse_basis_bps: Decimal,
+    /// これ以上不利な**決済方向**のベーシスでは、緊急性の低いエグジットを
+    /// 保留する（bps）。
+    ///
+    /// ファンディング裁定は [`crate::FillStyle`] の指値前提（`Urgency::Patient`）
+    /// なので、「レート差は細ったが今はベーシスが不利なので有利に戻るまで待つ」
+    /// という選択ができる。反転・データ欠損など緊急性の高い理由は保留しない。
+    #[serde(default = "default_funding_max_adverse_exit_basis_bps")]
+    pub max_adverse_exit_basis_bps: Decimal,
+    /// エグジットを保留し続ける上限（時間）。
+    ///
+    /// 待ち続けるのも危険なので上限を設ける。**実効的な最大保有時間は
+    /// `max_holding_hours + max_exit_deferral_hours`** になる点に注意
+    /// （起動時に `max_holding_hours` より短いことを検証する）。
+    #[serde(default = "default_funding_max_exit_deferral_hours")]
+    pub max_exit_deferral_hours: Decimal,
     /// 有利なベーシスを期待収益に加算するか。**既定 false（保守的）。**
     /// 価格差の収束を当てにすると、収束しなかった場合に想定が崩れる。
     #[serde(default)]
@@ -634,6 +649,26 @@ impl Config {
                 "strategy.funding_arb.max_staleness_delta_ms は 0 以上".into(),
             ));
         }
+        if self.strategy.funding_arb.enabled
+            && self.strategy.funding_arb.max_exit_deferral_hours < Decimal::ZERO
+        {
+            return Err(ConfigError::Invalid(
+                "strategy.funding_arb.max_exit_deferral_hours は 0 以上".into(),
+            ));
+        }
+        // 実効的な最大保有時間は max_holding_hours + max_exit_deferral_hours に
+        // なる。保留の上限が保有の上限以上だと、保有期間が実質 2 倍以上に伸びる。
+        if self.strategy.funding_arb.enabled
+            && self.strategy.funding_arb.max_exit_deferral_hours
+                >= self.strategy.funding_arb.max_holding_hours
+        {
+            return Err(ConfigError::Invalid(format!(
+                "strategy.funding_arb.max_exit_deferral_hours ({}) は max_holding_hours ({}) より\
+                 短くしてください（実効的な最大保有時間は両者の合計になります）",
+                self.strategy.funding_arb.max_exit_deferral_hours,
+                self.strategy.funding_arb.max_holding_hours
+            )));
+        }
         for (dex, symbols) in Dex::ALL
             .iter()
             .filter(|d| self.is_enabled(**d))
@@ -974,6 +1009,12 @@ fn default_funding_max_breakeven_intervals() -> u32 {
 fn default_funding_max_adverse_basis_bps() -> Decimal {
     Decimal::TWO
 }
+fn default_funding_max_adverse_exit_basis_bps() -> Decimal {
+    Decimal::from(3)
+}
+fn default_funding_max_exit_deferral_hours() -> Decimal {
+    Decimal::from(6)
+}
 fn default_funding_per_position_max_pct() -> Decimal {
     Decimal::new(10, 2)
 }
@@ -1202,6 +1243,8 @@ impl Default for FundingArbConfig {
             expected_intervals: default_funding_expected_intervals(),
             max_acceptable_breakeven_intervals: default_funding_max_breakeven_intervals(),
             max_adverse_basis_bps: default_funding_max_adverse_basis_bps(),
+            max_adverse_exit_basis_bps: default_funding_max_adverse_exit_basis_bps(),
+            max_exit_deferral_hours: default_funding_max_exit_deferral_hours(),
             count_favorable_basis: false,
             per_position_max_pct: default_funding_per_position_max_pct(),
             max_concurrent_positions: default_funding_max_positions(),
@@ -1502,6 +1545,23 @@ excluded_symbols = ["HYPE"]
             cfg.strategy.funding_arb.exit_rate_diff_bps
                 < cfg.strategy.funding_arb.min_rate_diff_bps
         );
+    }
+
+    #[test]
+    fn rejects_deferral_longer_than_the_holding_limit() {
+        // 実効的な最大保有時間は max_holding_hours + max_exit_deferral_hours。
+        // 保留の上限が保有の上限以上だと保有期間が実質 2 倍以上に伸びる。
+        let mut cfg = Config::default();
+        cfg.strategy.funding_arb.max_holding_hours = Decimal::from(72);
+        cfg.strategy.funding_arb.max_exit_deferral_hours = Decimal::from(72);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_exit_deferral_hours"), "{err}");
+
+        cfg.strategy.funding_arb.max_exit_deferral_hours = Decimal::from(6);
+        cfg.validate().unwrap();
+
+        cfg.strategy.funding_arb.max_exit_deferral_hours = Decimal::from(-1);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

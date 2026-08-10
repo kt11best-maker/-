@@ -4,6 +4,8 @@ use core_types::{Dex, FeeSchedule, Symbol, BPS_DENOMINATOR};
 use market_data::{BookStore, FundingStore};
 use rust_decimal::Decimal;
 
+use crate::signal::OpenPosition;
+
 /// 戦略に渡す市場状態のスナップショット。
 ///
 /// 板・ファンディング・手数料表への参照だけを持ち、自身は状態を持たない。
@@ -48,6 +50,21 @@ impl<'a> MarketContext<'a> {
         }
         // ショート側が高いほど有利（高く売って安く買える）
         Some((short_mid.0 - long_mid.0) / reference * BPS_DENOMINATOR)
+    }
+
+    /// **決済方向**から見た価格差（bps, 符号付き）。
+    ///
+    /// 建てる時と決済する時では食う板が逆になる（ロング側は売り、ショート側は
+    /// 買いで閉じる）ため、有利/不利の符号も反転する。
+    ///
+    /// - **正** = 決済にとって**有利**
+    /// - **負** = 決済にとって**不利**（今降りるとこの分だけ損を確定させる）
+    ///
+    /// エントリーで不利ベーシスを避けているのに、エグジットが無防備では非対称。
+    /// 緊急性の低いエグジットはこれを見て保留できる。
+    pub fn signed_exit_basis_bps(&self, position: &OpenPosition) -> Option<Decimal> {
+        // 建てた向きの逆から見る（引数を入れ替えると符号が反転する）
+        self.signed_basis_bps(position.symbol, position.short_dex, position.long_dex)
     }
 
     /// 2 DEX の板の鮮度差（ms, 符号付き）。

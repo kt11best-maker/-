@@ -196,6 +196,14 @@ expected_intervals = 12
 max_acceptable_breakeven_intervals = 6
 # これ以上不利なベーシス（価格差）では建てない
 max_adverse_basis_bps = 2.0
+# これ以上不利な「決済方向」のベーシスでは、緊急性の低いエグジット
+# （FundingBelowCost / MaxHoldingReached）を保留して有利に戻るのを待つ。
+# 反転・データ欠損は緊急性が高いので保留しない。
+max_adverse_exit_basis_bps = 3.0
+# 保留し続けるのも危険なので上限を設ける（時間）。
+# 実効的な最大保有時間は max_holding_hours + この値になる。
+# max_holding_hours より短いことを起動時に検証する。
+max_exit_deferral_hours = 6
 # 有利なベーシスを期待収益に加算するか。既定 false（収束を当てにしない）
 count_favorable_basis = false
 per_position_max_pct = 0.10

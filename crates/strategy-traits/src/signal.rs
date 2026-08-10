@@ -150,21 +150,85 @@ pub struct OpenPosition {
     /// そのまま引き継ぐこと。
     pub breakeven_intervals: u32,
     pub opened_at_wall_ms: u64,
-    /// これまでに跨いだ精算回数。
+    /// **エントリー時点で判明していた次回精算時刻**（wall clock, ms epoch）。
     ///
-    /// **精算のたびにインクリメントする責任は執行レイヤーにある。**
-    /// 精算時刻（`FundingRate::next_funding_time_ms`）を跨いだことを検知して
-    /// 増やすこと。ここが更新されないと breakeven の判定が永久に成立せず、
-    /// `max_holding_hours` まで降りられなくなる。
-    pub funding_intervals_collected: u32,
+    /// 精算サイクルの途中で建てた場合でも回数を正しく数えるために使う。
+    /// 取得できなかった場合は `None`（経過時間からの近似にフォールバックする）。
+    pub entry_next_funding_time_ms: Option<u64>,
+    /// 執行レイヤーが観測した実際の精算回数。
+    ///
+    /// **判定には使わない。** 判定は導出値
+    /// （[`OpenPosition::intervals_collected`]）で行う。ここは導出値との乖離を
+    /// 検知してログに出すための整合性チェック専用。
+    ///
+    /// フィールドを判定に使うと「誰も更新しない」事故が静かに起きる
+    /// （更新漏れ → 回収回数が常に 0 → レート差が細っても降りられない）。
+    pub observed_intervals_collected: u32,
+    /// エグジットを保留し始めた時刻（wall clock, ms epoch）。保留中でなければ `None`。
+    ///
+    /// **書き込むのは呼び出し側（執行レイヤー / ドライラン評価）の責務。**
+    /// `should_exit` は `&self` しか持たないため判定のみを行い、保留状態は
+    /// 更新しない。保留に入ったら設定し、エグジット条件が消えたらクリアする。
+    pub exit_deferred_since_ms: Option<u64>,
 }
+
+/// 1 時間のミリ秒数。
+const MS_PER_HOUR: u64 = 3_600_000;
 
 impl OpenPosition {
     /// 保有時間（時間）。
     pub fn holding_hours(&self, now_wall_ms: u64) -> Decimal {
         let elapsed_ms = now_wall_ms.saturating_sub(self.opened_at_wall_ms);
-        Decimal::from(elapsed_ms) / Decimal::from(3_600_000u32)
+        Decimal::from(elapsed_ms) / Decimal::from(MS_PER_HOUR)
     }
+
+    /// エントリー以降に跨いだファンディング精算の回数。
+    ///
+    /// **執行レイヤーによる更新に依存せず、時刻から導出する。** フィールドとして
+    /// 持つと「誰も更新しない」事故が静かに起き、レート差が細っても
+    /// `max_holding_hours` まで降りられなくなる。
+    ///
+    /// `entry_next_funding_time_ms` が分かっていれば、精算サイクルの途中で
+    /// 建てた場合でも正しく数えられる。分からない場合はエントリー時刻からの
+    /// 経過で近似する（最初の 1 回を過大評価しないよう切り捨てる）。
+    pub fn intervals_collected(&self, now_wall_ms: u64, interval_hours: Decimal) -> u32 {
+        let Some(interval_ms) = interval_to_ms(interval_hours) else {
+            return 0;
+        };
+        match self.entry_next_funding_time_ms {
+            Some(first) => {
+                if now_wall_ms < first {
+                    // まだ 1 回も精算していない
+                    return 0;
+                }
+                let after_first = (now_wall_ms - first) / interval_ms;
+                1u32.saturating_add(u32::try_from(after_first).unwrap_or(u32::MAX))
+            }
+            None => {
+                let elapsed = now_wall_ms.saturating_sub(self.opened_at_wall_ms);
+                u32::try_from(elapsed / interval_ms).unwrap_or(u32::MAX)
+            }
+        }
+    }
+
+    /// エグジットを保留してからの経過時間（時間）。保留中でなければ 0。
+    pub fn exit_deferred_hours(&self, now_wall_ms: u64) -> Decimal {
+        match self.exit_deferred_since_ms {
+            Some(since) => {
+                Decimal::from(now_wall_ms.saturating_sub(since)) / Decimal::from(MS_PER_HOUR)
+            }
+            None => Decimal::ZERO,
+        }
+    }
+}
+
+/// 精算間隔（時間）をミリ秒に直す。非正・過大な値は `None`。
+fn interval_to_ms(interval_hours: Decimal) -> Option<u64> {
+    if interval_hours <= Decimal::ZERO {
+        return None;
+    }
+    let ms = (interval_hours * Decimal::from(MS_PER_HOUR)).trunc();
+    u64::try_from(ms.mantissa()).ok().filter(|ms| *ms > 0)
 }
 
 /// ポジションを解消する理由。
@@ -263,9 +327,10 @@ mod tests {
         assert!(s.total_expected_profit_bps() > s.expected_profit_bps);
     }
 
-    #[test]
-    fn holding_hours() {
-        let p = OpenPosition {
+    const OPENED_MS: u64 = 1_700_000_000_000;
+
+    fn position() -> OpenPosition {
+        OpenPosition {
             strategy: StrategyKind::FundingArb,
             symbol: Symbol::Btc,
             long_dex: Dex::Lighter,
@@ -274,15 +339,75 @@ mod tests {
             entry_basis_bps: dec!(1),
             entry_rate_diff_bps: dec!(2),
             breakeven_intervals: 2,
-            opened_at_wall_ms: 1_700_000_000_000,
-            funding_intervals_collected: 3,
-        };
+            opened_at_wall_ms: OPENED_MS,
+            entry_next_funding_time_ms: None,
+            observed_intervals_collected: 0,
+            exit_deferred_since_ms: None,
+        }
+    }
+
+    #[test]
+    fn holding_hours() {
+        let p = position();
         // 3 時間半後
         assert_eq!(
-            p.holding_hours(1_700_000_000_000 + 3 * 3_600_000 + 1_800_000),
+            p.holding_hours(OPENED_MS + 3 * 3_600_000 + 1_800_000),
             dec!(3.5)
         );
         // 時計が巻き戻っても負にならない
         assert_eq!(p.holding_hours(1_600_000_000_000), Decimal::ZERO);
+    }
+
+    #[test]
+    fn intervals_collected_counts_from_the_first_settlement() {
+        let mut p = position();
+        // 建てた 30 分後が初回精算、以降 1 時間ごと
+        p.entry_next_funding_time_ms = Some(OPENED_MS + 1_800_000);
+
+        assert_eq!(p.intervals_collected(OPENED_MS, dec!(1)), 0);
+        // 初回精算の 1 ms 前はまだ 0
+        assert_eq!(p.intervals_collected(OPENED_MS + 1_799_999, dec!(1)), 0);
+        // 跨いだ瞬間に 1
+        assert_eq!(p.intervals_collected(OPENED_MS + 1_800_000, dec!(1)), 1);
+        // その 1 時間後に 2
+        assert_eq!(p.intervals_collected(OPENED_MS + 5_400_000, dec!(1)), 2);
+        // 8 時間精算なら初回のみ
+        assert_eq!(p.intervals_collected(OPENED_MS + 5_400_000, dec!(8)), 1);
+    }
+
+    #[test]
+    fn intervals_collected_falls_back_to_elapsed_time() {
+        let p = position();
+        assert_eq!(p.entry_next_funding_time_ms, None);
+
+        // 経過時間からの近似。最初の 1 回を過大評価しないよう切り捨てる
+        assert_eq!(p.intervals_collected(OPENED_MS, dec!(1)), 0);
+        assert_eq!(p.intervals_collected(OPENED_MS + 3_599_999, dec!(1)), 0);
+        assert_eq!(p.intervals_collected(OPENED_MS + 3_600_000, dec!(1)), 1);
+        assert_eq!(p.intervals_collected(OPENED_MS + 9_000_000, dec!(1)), 2);
+        // 30 分精算にも対応する
+        assert_eq!(p.intervals_collected(OPENED_MS + 3_600_000, dec!(0.5)), 2);
+    }
+
+    #[test]
+    fn intervals_collected_rejects_non_positive_intervals() {
+        let p = position();
+        assert_eq!(
+            p.intervals_collected(OPENED_MS + 86_400_000, Decimal::ZERO),
+            0
+        );
+        assert_eq!(p.intervals_collected(OPENED_MS + 86_400_000, dec!(-1)), 0);
+    }
+
+    #[test]
+    fn exit_deferred_hours() {
+        let mut p = position();
+        // 保留していなければ 0
+        assert_eq!(p.exit_deferred_hours(OPENED_MS + 86_400_000), Decimal::ZERO);
+
+        p.exit_deferred_since_ms = Some(OPENED_MS);
+        assert_eq!(p.exit_deferred_hours(OPENED_MS + 5_400_000), dec!(1.5));
+        // 時計が巻き戻っても負にならない
+        assert_eq!(p.exit_deferred_hours(OPENED_MS - 1_000), Decimal::ZERO);
     }
 }

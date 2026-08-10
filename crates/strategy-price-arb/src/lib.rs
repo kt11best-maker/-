@@ -469,7 +469,9 @@ mod tests {
             // 価格差アービトラージでは使わない（ファンディング裁定専用）
             breakeven_intervals: 0,
             opened_at_wall_ms: 1_700_000_000_000,
-            funding_intervals_collected: 0,
+            entry_next_funding_time_ms: None,
+            observed_intervals_collected: 0,
+            exit_deferred_since_ms: None,
         };
 
         // まだ乖離が残っている → 保持
@@ -498,7 +500,9 @@ mod tests {
             entry_rate_diff_bps: dec!(2),
             breakeven_intervals: 2,
             opened_at_wall_ms: 1_700_000_000_000,
-            funding_intervals_collected: 0,
+            entry_next_funding_time_ms: None,
+            observed_intervals_collected: 0,
+            exit_deferred_since_ms: None,
         };
         assert_eq!(strategy.should_exit(&position, &f.ctx()), None);
     }
