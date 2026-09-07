@@ -9,9 +9,13 @@ license.workspace = true
 config.workspace = true
 core-types.workspace = true
 strategy-traits.workspace = true
+async-trait.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 rust_decimal_macros.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

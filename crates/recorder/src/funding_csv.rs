@@ -46,12 +46,20 @@ pub const FUNDING_CSV_HEADER: &[&str] = &[
     "mark_price",
     "exchange_ts_ms",
     "latency_ms",
+    // 流動性指標。ファンディングと同じメッセージで届くので同じ行に並べる
+    // （分析時に時刻を突き合わせずに済む）。
+    "open_interest",
+    "volume_24h_usd",
+    // 出来高 / OI（どちらも USD 換算）。**高すぎる場合は回転売買の疑い。**
+    "volume_oi_ratio",
 ];
 
 /// レート値の小数桁数。レート自体は 1e-7 オーダーなので広めに取る。
 const RATE_SCALE: u32 = 12;
 /// 年率（%）の小数桁数。
 const PCT_SCALE: u32 = 6;
+/// 出来高 / OI 比率の小数桁数。
+const RATIO_SCALE: u32 = 6;
 
 /// 直近に記録した内容（変化検知と心拍の判定に使う）。
 #[derive(Debug, Clone, Copy)]
@@ -214,6 +222,15 @@ pub fn funding_to_row(rate: &FundingRate) -> Vec<String> {
         fmt_opt(rate.mark_price.map(|p| p.0.normalize().to_string())),
         fmt_opt(rate.trace.exchange_ts_ms),
         fmt_opt(rate.latency_ms()),
+        fmt_opt(rate.open_interest.map(|q| q.0.normalize().to_string())),
+        fmt_opt(rate.volume_24h_usd.map(|v| v.normalize().to_string())),
+        // 価格が無くて OI をノーショナル換算できない場合は空欄
+        // （数量と USD を割った無意味な値を残さない）。
+        fmt_opt(
+            rate.market_stats()
+                .volume_oi_ratio()
+                .map(|r| r.round_dp(RATIO_SCALE).normalize().to_string()),
+        ),
     ]
 }
 
@@ -272,7 +289,7 @@ pub fn spawn_funding_csv_writer(
 mod tests {
     use super::*;
     use config::FundingRecordingConfig;
-    use core_types::{MessageTrace, Price};
+    use core_types::{MessageTrace, Price, Quantity};
     use rust_decimal_macros::dec;
     use std::path::Path;
 
@@ -292,6 +309,8 @@ mod tests {
             next_funding_time_ms: Some(wall_ms + 3_600_000),
             index_price: Some(Price(dec!(36000.0))),
             mark_price: Some(Price(dec!(36000.5))),
+            open_interest: None,
+            volume_24h_usd: None,
             trace,
         }
     }
@@ -490,6 +509,61 @@ mod tests {
         assert_eq!(column(&rows[1], "current_rate"), "0.0001");
         assert_eq!(column(&rows[1], "latency_ms"), "12");
         assert_eq!(column(&rows[1], "index_price"), "36000");
+    }
+
+    #[test]
+    fn liquidity_metrics_ride_along_on_the_same_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = recorder_in(dir.path(), 300);
+        let with_stats = FundingRate {
+            open_interest: Some(Quantity(dec!(1000))),
+            volume_24h_usd: Some(dec!(72000000)),
+            mark_price: Some(Price(dec!(36000))),
+            ..rate(Dex::Hyperliquid, Symbol::Eth, dec!(0.0001), BASE_MS)
+        };
+        rec.record(&with_stats).unwrap();
+        rec.flush().unwrap();
+
+        let rows = read_csv(&dir.path().join("2023-11-14_ETH_funding.csv"));
+        assert_eq!(column(&rows[1], "open_interest"), "1000");
+        assert_eq!(column(&rows[1], "volume_24h_usd"), "72000000");
+        // 72,000,000 / (1000 × 36,000) = 2
+        assert_eq!(column(&rows[1], "volume_oi_ratio"), "2");
+    }
+
+    #[test]
+    fn ratio_is_empty_when_units_cannot_be_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = recorder_in(dir.path(), 300);
+        // 価格が無ければ OI を USD 換算できない → 比率は空欄（数量 ÷ USD を残さない）
+        let no_price = FundingRate {
+            open_interest: Some(Quantity(dec!(1000))),
+            volume_24h_usd: Some(dec!(72000000)),
+            mark_price: None,
+            index_price: None,
+            ..rate(Dex::Lighter, Symbol::Sol, dec!(0.0001), BASE_MS)
+        };
+        rec.record(&no_price).unwrap();
+        rec.flush().unwrap();
+
+        let rows = read_csv(&dir.path().join("2023-11-14_SOL_funding.csv"));
+        assert_eq!(column(&rows[1], "open_interest"), "1000");
+        assert_eq!(column(&rows[1], "volume_oi_ratio"), "");
+    }
+
+    #[test]
+    fn missing_liquidity_metrics_leave_empty_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = recorder_in(dir.path(), 300);
+        // 取れない DEX があっても記録は続く（穴は空欄で残す）
+        rec.record(&rate(Dex::EdgeX, Symbol::Hype, dec!(0.0001), BASE_MS))
+            .unwrap();
+        rec.flush().unwrap();
+
+        let rows = read_csv(&dir.path().join("2023-11-14_HYPE_funding.csv"));
+        assert_eq!(column(&rows[1], "open_interest"), "");
+        assert_eq!(column(&rows[1], "volume_24h_usd"), "");
+        assert_eq!(column(&rows[1], "volume_oi_ratio"), "");
     }
 
     #[test]

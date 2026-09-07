@@ -4,8 +4,14 @@
 //!
 //! - **戦略ごとの証拠金枠**（[`allocation`]）
 //! - **戦略ごとに独立して発動できるキルスイッチ**（[`killswitch`]）
+//! - **保有中のネットデルタ監視**（[`net_delta`] / [`position`] / [`watchdog`]）
 //!
 //! を持つ。証拠金維持率の監視は戦略横断で行い、悪化時は全体を止める。
+//!
+//! ネットデルタ監視は、`HedgeState` の片肺検知（= **建てる瞬間**の保護）とは
+//! 別物で、**保有し続けている間**の保護を担う。数時間〜数日保有する
+//! ファンディング裁定では、わずかなずれの蓄積で「市場中立のつもりで方向性
+//! リスクを持っている」状態になるのが最大の隠れたリスクになる。
 //!
 //! > **フェーズ1 時点の位置づけ**: 執行レイヤーがまだ無いため、ここは純粋な
 //! > 判定ロジックとして実装してある。フェーズ3 で `execution` を作る際に、
@@ -13,9 +19,17 @@
 
 pub mod allocation;
 pub mod killswitch;
+pub mod net_delta;
+pub mod position;
+pub mod watchdog;
 
 pub use allocation::{Allocation, AllocationError, BudgetDecision, MarginBudget};
-pub use killswitch::{HaltReason, KillSwitch, TradingState};
+pub use killswitch::{HaltReason, HaltSeverity, KillSwitch, TradingState};
+pub use net_delta::{
+    NetDeltaAction, NetDeltaStatus, PositionManager, RebalanceDecision, RebalancePlan, VenueQuote,
+};
+pub use position::{DexPosition, ExpectedPositions, PositionError, PositionSource};
+pub use watchdog::{spawn_net_delta_watchdog, MarkPrices, SharedKillSwitch};
 
 use rust_decimal::Decimal;
 use strategy_traits::{StrategyKind, TradeSignal};

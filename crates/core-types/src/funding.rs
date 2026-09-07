@@ -18,7 +18,8 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::num::{Price, BPS_DENOMINATOR};
+use crate::market_stats::MarketStats;
+use crate::num::{Price, Quantity, BPS_DENOMINATOR};
 use crate::symbol::{Dex, Symbol};
 use crate::trace::MessageTrace;
 
@@ -44,6 +45,13 @@ pub struct FundingRate {
     /// インデックス価格・マーク価格（取得できる場合）。
     pub index_price: Option<Price>,
     pub mark_price: Option<Price>,
+    /// 未決済建玉（**契約数量**）。取得できる DEX のみ。
+    ///
+    /// ファンディングと同じメッセージに含まれるため、**接続を増やさずに**
+    /// 相乗りさせている（[`MarketStats`] を参照）。
+    pub open_interest: Option<Quantity>,
+    /// 直近 24 時間の取引量（**USD 建て**）。取得できる DEX のみ。
+    pub volume_24h_usd: Option<Decimal>,
     pub trace: MessageTrace,
 }
 
@@ -86,6 +94,21 @@ impl FundingRate {
     /// 取引所 → 受信の遅延（ms）。
     pub fn latency_ms(&self) -> Option<i64> {
         self.trace.exchange_to_local_ms()
+    }
+
+    /// 相乗りしている流動性指標を取り出す。
+    ///
+    /// OI のノーショナル換算にはマーク価格を優先して使う（無ければインデックス
+    /// 価格）。どちらも無ければ換算せず、`volume_oi_ratio` は空欄になる。
+    pub fn market_stats(&self) -> MarketStats {
+        MarketStats {
+            dex: self.dex,
+            symbol: self.symbol,
+            open_interest: self.open_interest,
+            volume_24h_usd: self.volume_24h_usd,
+            reference_price: self.mark_price.or(self.index_price),
+            trace: self.trace,
+        }
     }
 }
 
@@ -182,6 +205,8 @@ mod tests {
             next_funding_time_ms: None,
             index_price: None,
             mark_price: None,
+            open_interest: None,
+            volume_24h_usd: None,
             trace: MessageTrace::on_receive(),
         }
     }

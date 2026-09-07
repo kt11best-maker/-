@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use config::LighterConfig;
-use core_types::{Dex, FundingRate, MessageTrace, OrderBook, Price, Symbol};
+use core_types::{Dex, FundingRate, MessageTrace, OrderBook, Price, Quantity, Symbol};
 use dex_traits::{
     Backoff, ConnectionState, ConnectionStatus, FundingChannel, FundingRateSource, MarketDataError,
     MarketDataSource, SourceCounters, SourceMetrics,
@@ -397,6 +397,10 @@ impl LighterMarketData {
             next_funding_time_ms: entry.next_funding_time_ms,
             index_price: entry.index_price.map(Price),
             mark_price: entry.mark_price.map(Price),
+            // 流動性指標も同じ `market_stats` に入っているので相乗りさせる
+            // （**購読も接続も増やさない**）。
+            open_interest: entry.open_interest.map(Quantity),
+            volume_24h_usd: entry.volume_24h_usd(),
             trace,
         });
     }

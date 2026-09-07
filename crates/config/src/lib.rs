@@ -47,6 +47,8 @@ pub struct Config {
     #[serde(default)]
     pub killswitch: KillSwitchConfig,
     #[serde(default)]
+    pub risk: RiskConfig,
+    #[serde(default)]
     pub funding: FundingConfig,
     /// DEX ごとの手数料率。**既定値は持たせない。**
     /// 未設定の DEX を含むペアは、戦略側でシグナルを出さずにスキップされる。
@@ -228,6 +230,97 @@ pub struct KillSwitchConfig {
     /// Bot 全体（両戦略を停止）の日次損失上限（%）。
     #[serde(default = "default_global_loss_limit_pct")]
     pub global_daily_loss_limit_pct: Decimal,
+}
+
+/// リスク管理（キルスイッチ以外）の設定。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskConfig {
+    #[serde(default)]
+    pub net_delta: NetDeltaConfig,
+}
+
+/// リバランス発注先の選び方。
+///
+/// どちらが有利かは銘柄・時間帯で変わるため、設定で切り替えられるようにしてある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceVenue {
+    /// 手数料が安い DEX を選ぶ（手数料が未設定の DEX は候補から外れる）。
+    CheaperFee,
+    /// 板が厚い DEX を選ぶ（板が無い DEX は候補から外れる）。
+    DeeperBook,
+}
+
+/// ネットデルタ（両建てのずれ）の監視設定。
+///
+/// # 閾値は必ずノーショナル（USD）で持つこと
+///
+/// BTC 0.003 と HYPE 0.003 では意味が全く違う。数量で閾値を持つと、銘柄ごとに
+/// 別の設定が必要になるうえ、価格変動で意味が変わってしまう。
+///
+/// # 閾値の間隔
+///
+/// リバランス自体にも手数料とスリッページがかかる。`warn_threshold_usd` と
+/// `rebalance_threshold_usd` の間に十分な幅を持たせないと、リバランスのコストが
+/// ファンディング収益を食う。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetDeltaConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// **実ポジション**の照合間隔（秒）。bot の想定ポジションではなく、
+    /// 各 DEX の API から取得した値を突き合わせる。
+    #[serde(default = "default_net_delta_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// ログ + 通知のみ（USD）。
+    #[serde(default = "default_net_delta_warn_usd")]
+    pub warn_threshold_usd: Decimal,
+    /// 自動リバランスを発動する閾値（USD）。
+    #[serde(default = "default_net_delta_rebalance_usd")]
+    pub rebalance_threshold_usd: Decimal,
+    /// 全ポジション解消（ハード停止）の閾値（USD）。
+    #[serde(default = "default_net_delta_critical_usd")]
+    pub critical_threshold_usd: Decimal,
+    /// bot の想定ポジションと実ポジションの乖離許容値（USD）。
+    ///
+    /// これを超えたら**状態不整合**として新規発注を停止する（ソフト停止）。
+    /// 自分のポジションを正しく把握できていない状態で発注を続けるのは危険。
+    #[serde(default = "default_net_delta_max_drift_usd")]
+    pub max_drift_usd: Decimal,
+    /// リバランス発注先の選び方。
+    #[serde(default = "default_rebalance_venue")]
+    pub rebalance_venue: RebalanceVenue,
+    /// リバランスがこの回数連続で失敗したらソフト停止する。
+    #[serde(default = "default_max_rebalance_failures")]
+    pub max_consecutive_rebalance_failures: u32,
+    /// DEX × 銘柄ごとの最小注文単位。**既定値は持たせない。**
+    ///
+    /// 未設定の DEX / 銘柄はリバランスの発注先候補から外れる（手数料と同じ扱い。
+    /// 確認前の値で発注させないため）。差分が最小注文単位を下回る場合も同様に
+    /// 発注せず、警告に留める（発注エラーを繰り返すだけになる）。
+    #[serde(default)]
+    pub min_order_qty: BTreeMap<Dex, BTreeMap<Symbol, Decimal>>,
+}
+
+impl NetDeltaConfig {
+    /// その DEX × 銘柄の最小注文単位。**未設定なら `None`。**
+    pub fn min_order_qty(&self, dex: Dex, symbol: Symbol) -> Option<Decimal> {
+        self.min_order_qty.get(&dex)?.get(&symbol).copied()
+    }
+
+    /// 最小注文単位が未設定の（= リバランスの発注先にできない）DEX。
+    pub fn dexes_missing_min_order_qty(&self, dexes: &[Dex], symbols: &[Symbol]) -> Vec<Dex> {
+        dexes
+            .iter()
+            .copied()
+            .filter(|dex| {
+                symbols
+                    .iter()
+                    .any(|s| self.min_order_qty(*dex, *s).is_none())
+            })
+            .collect()
+    }
 }
 
 /// ファンディングレート収集の設定。
@@ -610,6 +703,7 @@ impl Config {
             ));
         }
         self.validate_allocation()?;
+        self.validate_net_delta()?;
         if self.strategy.funding_arb.enabled
             && self.strategy.funding_arb.max_holding_hours <= Decimal::ZERO
         {
@@ -678,6 +772,65 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "{dex} で購読する銘柄が 1 つもありません（excluded_symbols を確認してください）"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// ネットデルタ監視の閾値を検証する。
+    ///
+    /// 閾値の大小関係が崩れていると、警告を飛ばして即ハード停止したり、
+    /// リバランスが一度も発動しなかったりする。**起動時に落とす。**
+    fn validate_net_delta(&self) -> Result<(), ConfigError> {
+        let nd = &self.risk.net_delta;
+        if !nd.enabled {
+            return Ok(());
+        }
+        if nd.check_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "risk.net_delta.check_interval_secs は 1 以上".into(),
+            ));
+        }
+        for (name, value) in [
+            ("warn_threshold_usd", nd.warn_threshold_usd),
+            ("rebalance_threshold_usd", nd.rebalance_threshold_usd),
+            ("critical_threshold_usd", nd.critical_threshold_usd),
+            ("max_drift_usd", nd.max_drift_usd),
+        ] {
+            if value <= Decimal::ZERO {
+                return Err(ConfigError::Invalid(format!(
+                    "risk.net_delta.{name} は 0 より大きくしてください（現在: {value}）"
+                )));
+            }
+        }
+        if nd.warn_threshold_usd >= nd.rebalance_threshold_usd {
+            return Err(ConfigError::Invalid(format!(
+                "risk.net_delta.warn_threshold_usd ({}) は rebalance_threshold_usd ({}) より\
+                 小さくしてください（リバランスのコストがファンディング収益を食わないよう、\
+                 2 つの閾値には十分な幅を持たせること）",
+                nd.warn_threshold_usd, nd.rebalance_threshold_usd
+            )));
+        }
+        if nd.rebalance_threshold_usd >= nd.critical_threshold_usd {
+            return Err(ConfigError::Invalid(format!(
+                "risk.net_delta.rebalance_threshold_usd ({}) は critical_threshold_usd ({}) より\
+                 小さくしてください（是正を試みる前に全ポジション解消になります）",
+                nd.rebalance_threshold_usd, nd.critical_threshold_usd
+            )));
+        }
+        if nd.max_consecutive_rebalance_failures == 0 {
+            return Err(ConfigError::Invalid(
+                "risk.net_delta.max_consecutive_rebalance_failures は 1 以上".into(),
+            ));
+        }
+        for (dex, per_symbol) in &nd.min_order_qty {
+            for (symbol, qty) in per_symbol {
+                if *qty <= Decimal::ZERO {
+                    return Err(ConfigError::Invalid(format!(
+                        "risk.net_delta.min_order_qty.{dex}.{symbol} は 0 より大きくしてください\
+                         （現在: {qty}）"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1039,6 +1192,27 @@ fn default_strategy_loss_limit_pct() -> Decimal {
 fn default_global_loss_limit_pct() -> Decimal {
     Decimal::from(3)
 }
+fn default_net_delta_check_interval_secs() -> u64 {
+    60
+}
+fn default_net_delta_warn_usd() -> Decimal {
+    Decimal::from(50)
+}
+fn default_net_delta_rebalance_usd() -> Decimal {
+    Decimal::from(200)
+}
+fn default_net_delta_critical_usd() -> Decimal {
+    Decimal::from(1_000)
+}
+fn default_net_delta_max_drift_usd() -> Decimal {
+    Decimal::from(100)
+}
+fn default_rebalance_venue() -> RebalanceVenue {
+    RebalanceVenue::CheaperFee
+}
+fn default_max_rebalance_failures() -> u32 {
+    3
+}
 fn default_csv_dir() -> PathBuf {
     PathBuf::from("data")
 }
@@ -1273,6 +1447,22 @@ impl Default for KillSwitchConfig {
             price_arb_daily_loss_limit_pct: default_strategy_loss_limit_pct(),
             funding_arb_daily_loss_limit_pct: default_strategy_loss_limit_pct(),
             global_daily_loss_limit_pct: default_global_loss_limit_pct(),
+        }
+    }
+}
+
+impl Default for NetDeltaConfig {
+    fn default() -> Self {
+        NetDeltaConfig {
+            enabled: true,
+            check_interval_secs: default_net_delta_check_interval_secs(),
+            warn_threshold_usd: default_net_delta_warn_usd(),
+            rebalance_threshold_usd: default_net_delta_rebalance_usd(),
+            critical_threshold_usd: default_net_delta_critical_usd(),
+            max_drift_usd: default_net_delta_max_drift_usd(),
+            rebalance_venue: default_rebalance_venue(),
+            max_consecutive_rebalance_failures: default_max_rebalance_failures(),
+            min_order_qty: BTreeMap::new(),
         }
     }
 }
@@ -1618,6 +1808,88 @@ heartbeat_interval_secs = 300
         cfg.funding
             .intervals_hours
             .insert(Dex::Lighter, Decimal::ZERO);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_net_delta_section() {
+        let cfg: Config = toml::from_str(
+            r#"
+[risk.net_delta]
+enabled = true
+check_interval_secs = 60
+warn_threshold_usd = 50
+rebalance_threshold_usd = 200
+critical_threshold_usd = 1000
+max_drift_usd = 100
+rebalance_venue = "deeper_book"
+
+[risk.net_delta.min_order_qty.hyperliquid]
+BTC = 0.0001
+
+[risk.net_delta.min_order_qty.lighter]
+BTC = 0.001
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let nd = &cfg.risk.net_delta;
+        assert_eq!(nd.check_interval_secs, 60);
+        assert_eq!(nd.rebalance_venue, RebalanceVenue::DeeperBook);
+        assert_eq!(
+            nd.min_order_qty(Dex::Lighter, Symbol::Btc),
+            Some(Decimal::new(1, 3))
+        );
+        // 未設定は「不明」のまま。手数料と同じく推測で埋めない
+        assert_eq!(nd.min_order_qty(Dex::Hyperliquid, Symbol::Eth), None);
+        assert_eq!(nd.min_order_qty(Dex::EdgeX, Symbol::Btc), None);
+        assert_eq!(
+            nd.dexes_missing_min_order_qty(&[Dex::Hyperliquid, Dex::Lighter], &[Symbol::Btc]),
+            Vec::new()
+        );
+        assert_eq!(
+            nd.dexes_missing_min_order_qty(&[Dex::Hyperliquid], &[Symbol::Btc, Symbol::Eth]),
+            vec![Dex::Hyperliquid]
+        );
+    }
+
+    #[test]
+    fn rejects_net_delta_thresholds_out_of_order() {
+        // 警告より先にリバランスが発動する設定は事故のもと
+        let mut cfg = Config::default();
+        cfg.risk.net_delta.warn_threshold_usd = Decimal::from(300);
+        assert!(cfg.validate().is_err());
+
+        // 是正を試みる前に全ポジション解消になる設定
+        let mut cfg = Config::default();
+        cfg.risk.net_delta.critical_threshold_usd = Decimal::from(100);
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.risk.net_delta.max_drift_usd = Decimal::ZERO;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.risk.net_delta.check_interval_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        // 無効化していれば閾値の検証はしない（使わない値で起動を止めない）
+        let mut cfg = Config::default();
+        cfg.risk.net_delta.enabled = false;
+        cfg.risk.net_delta.check_interval_secs = 0;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_non_positive_min_order_qty() {
+        let mut cfg = Config::default();
+        cfg.risk
+            .net_delta
+            .min_order_qty
+            .entry(Dex::Lighter)
+            .or_default()
+            .insert(Symbol::Btc, Decimal::ZERO);
         assert!(cfg.validate().is_err());
     }
 

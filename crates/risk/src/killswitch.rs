@@ -11,6 +11,25 @@ use config::KillSwitchConfig;
 use rust_decimal::Decimal;
 use strategy_traits::StrategyKind;
 
+/// 停止の重さ。
+///
+/// **同じ「停止」でも、ポジションを解消すべきかどうかが違う。**
+///
+/// - [`HaltSeverity::Soft`][]: 新規発注だけを止め、**保有ポジションはそのまま**
+///   人間の確認を待つ。自分のポジションを正しく把握できていない疑いがある状態
+///   （drift 超過など）では、自動で解消に動く方が危険なため。
+/// - [`HaltSeverity::Hard`][]: 新規発注を止めたうえで**全ポジションを解消**する。
+///
+/// 実際に解消を発注するのはフェーズ3 の執行レイヤー。ここは「どちらの停止か」を
+/// 判定して保持するだけで、I/O は持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltSeverity {
+    /// 新規発注のみ停止（保有は維持し、人間の確認を待つ）。
+    Soft,
+    /// 新規発注停止 + 全ポジション解消。
+    Hard,
+}
+
 /// 停止の理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HaltReason {
@@ -20,6 +39,16 @@ pub enum HaltReason {
     GlobalDailyLoss,
     /// 証拠金維持率の悪化。
     MarginPressure,
+    /// ネットデルタが critical 閾値を超えた（= 実質的な方向性ポジション）。
+    NetDeltaCritical,
+    /// 想定ポジションと実ポジションの乖離が許容値を超えた。
+    ///
+    /// **ソフト停止。** 自分のポジションを正しく把握できていない状態で発注を
+    /// 続けるのは危険だが、把握できていない状態で自動解消に動くのも危険なので、
+    /// 人間の確認を待つ。
+    PositionDrift,
+    /// リバランスが規定回数連続で失敗した。**ソフト停止。**
+    RebalanceFailed,
     /// 手動停止。
     Manual,
 }
@@ -30,8 +59,32 @@ impl HaltReason {
             HaltReason::StrategyDailyLoss => "strategy_daily_loss",
             HaltReason::GlobalDailyLoss => "global_daily_loss",
             HaltReason::MarginPressure => "margin_pressure",
+            HaltReason::NetDeltaCritical => "net_delta_critical",
+            HaltReason::PositionDrift => "position_drift",
+            HaltReason::RebalanceFailed => "rebalance_failed",
             HaltReason::Manual => "manual",
         }
+    }
+
+    /// この理由での停止が、保有ポジションの解消まで求めるか。
+    ///
+    /// 状態を把握できていないことが原因の停止（drift / リバランス失敗）は
+    /// **ソフト**。損失・維持率・デルタ超過など、持ち続けること自体が危険な
+    /// 事象は**ハード**として扱う。
+    pub fn severity(&self) -> HaltSeverity {
+        match self {
+            HaltReason::PositionDrift | HaltReason::RebalanceFailed => HaltSeverity::Soft,
+            HaltReason::StrategyDailyLoss
+            | HaltReason::GlobalDailyLoss
+            | HaltReason::MarginPressure
+            | HaltReason::NetDeltaCritical
+            | HaltReason::Manual => HaltSeverity::Hard,
+        }
+    }
+
+    /// 全ポジションを解消すべき停止か（フェーズ3 の執行レイヤーが使う）。
+    pub fn requires_liquidation(&self) -> bool {
+        self.severity() == HaltSeverity::Hard
     }
 }
 
@@ -260,6 +313,25 @@ mod tests {
         let mut k = switch();
         assert!(k.record_daily_pnl_pct(dec!(1.5), dec!(2.0)).is_empty());
         assert!(k.can_trade(StrategyKind::PriceArb));
+    }
+
+    #[test]
+    fn soft_and_hard_halts_are_distinguished() {
+        // 状態を把握できていないことが原因の停止では、自動で解消に動かない
+        assert_eq!(HaltReason::PositionDrift.severity(), HaltSeverity::Soft);
+        assert_eq!(HaltReason::RebalanceFailed.severity(), HaltSeverity::Soft);
+        assert!(!HaltReason::PositionDrift.requires_liquidation());
+
+        // 持ち続けること自体が危険な事象は全解消
+        assert_eq!(HaltReason::NetDeltaCritical.severity(), HaltSeverity::Hard);
+        assert!(HaltReason::NetDeltaCritical.requires_liquidation());
+        assert!(HaltReason::GlobalDailyLoss.requires_liquidation());
+
+        // どちらでも新規発注は止まる
+        let mut k = switch();
+        k.halt_all(HaltReason::PositionDrift);
+        assert!(!k.can_trade(StrategyKind::PriceArb));
+        assert!(!k.can_trade(StrategyKind::FundingArb));
     }
 
     #[test]

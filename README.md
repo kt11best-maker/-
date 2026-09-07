@@ -14,9 +14,10 @@ DEX パーペチュアル・アービトラージ Bot の実装。**実弾は一
 単純になる。edgeX / Aster / dYdX は実装済みだが**設定で無効化**している
 （コードもテストも残す。再開は `enabled = true` だけでよい）。
 
-現在の到達点: 板データとファンディングレートの 24 時間収集、両戦略の**判定
-ロジック**（純粋関数）。発注・状態機械・永続化・通知はフェーズ3 以降で、
-まだ存在しない。
+現在の到達点: 板データ・ファンディングレート・流動性指標（OI / 出来高）の
+24 時間収集、両戦略の**判定ロジック**（純粋関数）、**ネットデルタ監視**の判定と
+記録（実ポジション取得はフェーズ3）。発注・状態機械・永続化・通知はフェーズ3
+以降で、まだ存在しない。
 
 ## クイックスタート
 
@@ -30,7 +31,9 @@ cargo run --release -p collector -- --config config/collector.toml
 出力先:
 
 - `data/YYYY-MM-DD_<SYMBOL>.csv` — 価格差スナップショット（銘柄ごと・日次）
-- `data/YYYY-MM-DD_<SYMBOL>_funding.csv` — ファンディングレート（**1 行 = 1 DEX**）
+- `data/YYYY-MM-DD_<SYMBOL>_funding.csv` — ファンディングレート + 流動性指標
+  （**1 行 = 1 DEX**）
+- `data/YYYY-MM-DD_net_delta.csv` — ネットデルタの照合結果（**フェーズ3 で有効化**）
 - `logs/collector.log.YYYY-MM-DD` — 運用イベント（JSON, 日次ローテーション）
 
 ログレベルは `RUST_LOG=debug` で上書きできる（設定ファイルより優先）。
@@ -51,7 +54,7 @@ perp-arb-bot/
 │   ├── strategy-traits/  # 戦略の共通インターフェース（TradeSignal / Strategy）
 │   ├── strategy-price-arb/    # 価格差アービトラージの判定
 │   ├── strategy-funding-arb/  # ファンディング裁定の判定
-│   ├── risk/             # 戦略別の証拠金枠・多層キルスイッチ
+│   ├── risk/             # 戦略別の証拠金枠・多層キルスイッチ・ネットデルタ監視
 │   ├── recorder/         # JSON ログ初期化・CSV 出力
 │   └── config/           # TOML 設定
 └── bin/collector/        # 実行バイナリ（タスク結線・supervisor・監視）
@@ -72,6 +75,7 @@ perp-arb-bot/
  ├─ spawn: CSV writer タスク（バッファリングして定期 flush）
  ├─ spawn: ファンディング収集タスク（対応 DEX のみ） ─→ mpsc<FundingRate>
  ├─ spawn: ファンディング CSV writer タスク
+ ├─ spawn: ネットデルタ監視タスク（フェーズ3 で有効化）─→ mpsc<NetDeltaStatus>
  ├─ spawn: 監視タスク（接続状態・レイテンシ・スループット）
  └─ SIGINT/SIGTERM → CSV を flush して正常終了
 ```
@@ -237,6 +241,75 @@ reserve_pct = 0.30      # どちらの戦略も使えない緊急クローズ専
 継続してよい場合があるため。Bot 全体の日次損失上限に達した場合のみ両方を止める。
 証拠金維持率の悪化は戦略横断の事象なので全体停止として扱う。
 
+停止には**ソフトとハードの 2 種類**がある。
+
+| 停止 | 動作 | 理由の例 |
+|---|---|---|
+| ソフト | **新規発注のみ停止**（保有は維持し、人間の確認を待つ） | `position_drift` / `rebalance_failed` |
+| ハード | 新規発注停止 + **全ポジション解消** | 日次損失上限 / 証拠金維持率 / `net_delta_critical` |
+
+自分のポジションを正しく把握できていない疑いがある状態（drift 超過）で、自動で
+解消に動く方が危険なのでソフトにしてある。解消の発注そのものはフェーズ3 の
+執行レイヤーが行い、`risk` は「どちらの停止か」を判定して保持するだけ。
+
+### ネットデルタ管理（`risk::net_delta`）
+
+`HedgeState` の片肺検知は「**建てる瞬間**」の保護、ネットデルタ管理は
+「**保有し続けている間**」の保護。**両者は別物で、片方だけでは不十分。**
+
+価格差アービトラージは保有時間が秒〜分なので前者で概ね足りるが、ファンディング
+裁定は数時間〜数日保有する。その間に部分約定の端数・決済時の端数・ADL・数量の
+丸めでずれが蓄積し、「市場中立のつもりで方向性リスクを持っている」状態になる。
+これがこの戦略における最大の隠れたリスク。
+
+```text
+Hyperliquid = +0.500 BTC
+Lighter     = -0.497 BTC
+Net Delta   = +0.003 BTC   ← 実質的な方向性ポジション
+```
+
+監視対象は「bot が記録している想定ポジション」ではなく、**各 DEX の API から
+取得した実ポジション**。想定と実際が乖離していること自体が検知すべき異常
+（約定通知の取りこぼし、強制決済・ADL、クラッシュ後の復元漏れ）なので、
+ネットデルタ（`net_delta`）とは別に想定との差（`drift`）も監視する。
+
+```toml
+[risk.net_delta]
+check_interval_secs = 60
+warn_threshold_usd = 50          # ログ + 通知のみ
+rebalance_threshold_usd = 200    # 差分だけ発注して中立に戻す
+critical_threshold_usd = 1000    # ハード停止（全ポジション解消）
+max_drift_usd = 100              # ソフト停止（新規発注のみ停止）
+rebalance_venue = "cheaper_fee"  # cheaper_fee | deeper_book
+```
+
+| 条件 | 動作 |
+|---|---|
+| `net_delta_usd > warn_threshold` | ログ + 通知のみ |
+| `net_delta_usd > rebalance_threshold` | リバランス発注（フェーズ3） |
+| `net_delta_usd > critical_threshold` | **ハード停止**（全ポジション解消） |
+| `drift_usd > max_drift_usd` | **ソフト停止**（新規発注のみ停止・人間の確認待ち） |
+| リバランスが規定回数連続で失敗 | ソフト停止 |
+
+判定の要点:
+
+- **閾値は必ずノーショナル（USD）。** BTC 0.003 と HYPE 0.003 では意味が全く違う。
+- **価格が取れない場合は中立と決めつけない。** `price_unavailable` として警告し、
+  判定を保留する（0 換算で「ずれていない」ように見せない）。
+- **実ポジションを取得できない DEX があれば、その周期の判定自体を見送る。**
+  「取得できなかった」を「フラット」と混同すると片肺を見落とす。
+- リバランスの差分が**最小注文単位を下回る場合は発注しない**（エラーを繰り返す
+  だけになる）。最小注文単位は手数料と同じく**既定値を持たせていない**ので、
+  未設定の DEX は発注先候補から外れる。
+- `warn_threshold_usd` と `rebalance_threshold_usd` の間隔が狭いと、リバランスの
+  手数料とスリッページがファンディング収益を食う。起動時に大小関係を検証する。
+
+> **フェーズ1 では監視タスクは起動しない。** 実ポジション取得（`PositionSource`）
+> には認証付き API が必要で、発注機能の無いフェーズ1 には実装が無い。起動時に
+> その旨を警告し、フェーズ3 で `bin/collector` の `build_position_sources` に
+> 各 DEX の実装を足せばそのまま動く。判定ロジックと CSV 記録は実装済みで、
+> テストも回っている。
+
 ### 手数料
 
 **既定値を持たせていない。** 未設定の DEX を含むペアは、戦略がシグナルを出さずに
@@ -326,10 +399,17 @@ bps は基準価格に「両 mid の中点」を使う。A/B を入れ替えて�
 | `next_funding_time_ms` | 次回精算時刻（提供する DEX のみ） |
 | `index_price` / `mark_price` | インデックス価格・マーク価格 |
 | `exchange_ts_ms` / `latency_ms` | 取引所側タイムスタンプと遅延 |
+| `open_interest` | 未決済建玉（**契約数量**。USD ではない） |
+| `volume_24h_usd` | 直近 24 時間の取引量（**USD 建て**） |
+| `volume_oi_ratio` | 出来高 / OI（どちらも USD 換算）。**高すぎる場合は回転売買の疑い** |
 
 **記録は変化時のみ。** `current_rate` が前回と同じ行は書かない。ただし値が
 変わらなくても `heartbeat_interval_secs`（既定 300 秒）ごとに 1 行残す
 （**データの欠損と bot の停止を区別できるようにするため**）。
+
+> 末尾 3 列（OI・出来高）は後から追加した。ヘッダは新規ファイル作成時にだけ
+> 書かれるため、**列追加前に作られた同日のファイルに追記すると列数がずれる。**
+> 日付が変わってから再開するか、古いファイルを退避すること。
 
 ### 精算間隔の正規化（最重要）
 
@@ -360,6 +440,52 @@ DEX によってファンディングの精算間隔が異なる（1 時間ご�
 > `<symbol>@depth@100ms` と同じ接続に相乗りできるが、**受信メッセージが 1 秒
 > あたり 10 件までという制約**がある。4 銘柄 × (depth 10 件/秒 + markPrice 1 件/秒)
 > が上限に触れないか必ず計算すること。触れる場合は接続を分けるか `@3s` を使う。
+
+### 流動性指標（Open Interest / 取引量）
+
+**ファンディングと同じパイプラインに相乗りさせている。新しい WS 接続も購読も
+増やさない。** Hyperliquid の `activeAssetCtx`（`openInterest` / `dayNtlVlm`）も
+Lighter の `market_stats`（`open_interest` / `daily_*_token_volume`）も、ファン
+ディングと同じメッセージに入っているため、同じ行として CSV に並ぶ。
+
+何に使うか:
+
+- **見かけの流動性と実需の乖離**: 出来高に対して OI が極端に小さい（=
+  `volume_oi_ratio` が大きい）場合、ポイント稼ぎ目的の回転売買が出来高を膨らませて
+  いる可能性がある。板が想定より薄く、アービトラージの執行に耐えない
+- **ファンディングレートの背景理解**: OI が偏っている DEX はレートが高くなる。
+  レート差が持続するかの判断材料になる
+- **銘柄の選定**: OI が小さすぎる銘柄は、想定サイズが板を動かしてしまう
+
+**単位を混ぜないこと。** `open_interest` は契約数量、`volume_24h_usd` は USD。
+`volume_oi_ratio` は OI をマーク価格（無ければインデックス価格）でノーショナル
+換算してから割る。価格が取れない場合は**空欄**にする（数量 ÷ USD の無意味な値を
+残さない）。取得できない DEX の列も空欄のまま残る。
+
+記録頻度はファンディングに従う（`current_rate` の変化時 + 心拍）。OI と出来高
+だけのために行を増やすことはしない。
+
+## ネットデルタ CSV
+
+`data/YYYY-MM-DD_net_delta.csv`。**銘柄で分けない**（1 行 = 1 銘柄の照合結果で、
+更新頻度が低く行数も少ないため、1 ファイルの方が突き合わせやすい）。
+
+フェーズ2 以降で「**どれくらいデルタがずれるものなのか**」を実測するための記録。
+`warn` / `rebalance` の閾値を最終的に決めるのはこのデータになる。
+
+| カラム | 説明 |
+|---|---|
+| `timestamp_ms` | 照合時刻（wall clock, ms epoch） |
+| `symbol` | 銘柄 |
+| `pos_hyperliquid` / `pos_edgex` / … | DEX ごとの**実ポジション**（ロングが正）。**空欄は「照合対象外」で 0 とは別** |
+| `net_delta` | 全 DEX 合計のネットポジション（数量） |
+| `net_delta_usd` | ノーショナル換算（絶対値）。**判定はこの列で行う** |
+| `mark_price` | 換算に使った価格。空欄なら判定は保留（`price_unavailable`） |
+| `drift_usd` | 想定ポジションとの乖離（USD, 絶対値の総和） |
+| `action` | `none` / `warned` / `rebalanced` / `halted_soft` / `halted` / `price_unavailable` |
+
+価格差・ファンディング CSV と違い、**変化検知は行わない**。照合した周期はすべて
+残す（ずれていない時間の長さも分析対象になるため）。
 
 ## 設定
 
@@ -394,6 +520,13 @@ DEX によってファンディングの精算間隔が異なる（1 時間ご�
 | `recording.funding.heartbeat_interval_secs` | 300 | 値が変わらなくても残す間隔 |
 | `dex.dydx.connected_timeout_secs` | 10 | `connected` を待つ上限 |
 | `allocation.*` | 0.30/0.40/0.30 | 戦略別の証拠金枠（合計 1.0 以下） |
+| `risk.net_delta.check_interval_secs` | 60 | 実ポジションの照合間隔 |
+| `risk.net_delta.warn_threshold_usd` | 50 | ログ + 通知のみ（**USD で判定**） |
+| `risk.net_delta.rebalance_threshold_usd` | 200 | リバランス発注。warn と十分な幅を空ける |
+| `risk.net_delta.critical_threshold_usd` | 1000 | ハード停止（全ポジション解消） |
+| `risk.net_delta.max_drift_usd` | 100 | 想定との乖離。超過でソフト停止 |
+| `risk.net_delta.rebalance_venue` | `cheaper_fee` | `cheaper_fee` / `deeper_book` |
+| `risk.net_delta.min_order_qty.<dex>.<symbol>` | なし | **未設定の DEX は発注先に選ばれない** |
 | `fees.<dex>.taker_bps` / `maker_bps` | なし | **未設定の DEX はシグナル対象外** |
 | `monitoring.latency_warn_threshold_ms` | 500 | 超過時に警告ログ |
 
@@ -533,7 +666,7 @@ edgeX（アプリ層 JSON）と dYdX（プロトコル制御フレーム）は�
 ## テスト
 
 ```bash
-cargo test --workspace     # 297 tests
+cargo test --workspace     # 360 tests
 cargo clippy --workspace --all-targets
 ```
 
@@ -554,7 +687,9 @@ cargo clippy --workspace --all-targets
   `message_id` 欠損の検知と再購読、クロスした板が捨てられずカウントされること、
   プロトコルレベル ping への pong 応答
 - `recorder`: 変化時のみ記録するロジック（同値の連続はスキップ、heartbeat 超過で記録）、
-  精算間隔が違っても `annualized_pct` が一致すること
+  精算間隔が違っても `annualized_pct` が一致すること、OI・出来高が同じ行に並ぶこと、
+  価格が無いときに `volume_oi_ratio` を空欄にすること、ネットデルタ CSV の
+  DEX 別列と日次分割
 - `strategy-price-arb`: 手数料超え判定、鮮度差フィルタ、VWAP/best 気配の切替、
   板が薄い場合、手数料未設定時のスキップ、収束時の手仕舞い
 - `strategy-funding-arb`: 手数料回収回数、不利ベーシスの棄却、有利ベーシスを
@@ -565,7 +700,14 @@ cargo clippy --workspace --all-targets
   精算間隔が違う場合に長い方で数えること、決済ベーシスによる保留と保留上限、
   緊急性の高い理由が保留されないこと
 - `risk`: 戦略枠の分離、枠超過の縮小承認、緊急クローズ余力の侵食検知、
-  戦略別キルスイッチと全体停止の優先関係
+  戦略別キルスイッチと全体停止の優先関係、ソフト停止とハード停止の区別
+- `risk::net_delta`: 完全相殺でゼロになること、片側不足の符号、ノーショナル換算、
+  各閾値で選ばれるアクション（warn / rebalance / halt）、最小注文単位を下回る
+  差分では発注しないこと、drift 超過でソフト停止すること、
+  **想定ポジションが正しくても実ポジションがずれていれば検知されること**
+  （想定値だけ見ていたら気づけないケース）、価格が無いときに中立と誤認しないこと
+- `risk::watchdog`: 1 つでも実ポジションを取得できなければその周期を見送ること、
+  critical でキルスイッチが発動すること、shutdown で停止すること
 - `bin/collector`: 生 JSON → 価格差計算 → CSV 1 行までの統合テスト
 
 ## フェーズ1 完了後に分析すること
@@ -579,6 +721,10 @@ cargo clippy --workspace --all-targets
 5. DEX 別のレイテンシ分布と時間帯変動
 6. **DEX ペアごとの `staleness_delta_ms` の分布を比較**し、鮮度差で説明できてしまう
    乖離を除外したうえで、真に利益機会がありそうなペアを特定する
+
+流動性指標（OI・出来高）が取れた DEX については、`volume_oi_ratio` が極端に
+大きい銘柄・DEX を洗い出す（回転売買で出来高だけが膨らんでいる疑い）。板の厚さ
+（`depth_*_bps10`）と突き合わせて、想定サイズが執行できるかを判断する。
 
 ファンディング裁定側は、収集を実装したうえで以下を見る:
 
@@ -601,12 +747,24 @@ cargo clippy --workspace --all-targets
   フェーズ2 のドライラン評価とフェーズ3 の執行レイヤーで実装する。
   **判定は保留状態が未設定でも壊れない**（保留 0 時間として扱われ、上限判定が
   すぐ効くだけ）。
+- **ネットデルタ監視の起動**: 判定ロジック・監視タスク・CSV 記録は実装済みだが、
+  実ポジション取得（`PositionSource`）に認証付き API が要るため、フェーズ1 では
+  起動しない（起動時に警告を出す）。フェーズ3 で `bin/collector` の
+  `build_position_sources` に各 DEX の実装を足す。
+- **リバランスの発注**: `plan_rebalance` は「どの DEX にどちら向きで何枚」までを
+  決める。実際の発注・約定確認・再試行は執行レイヤー（フェーズ3）の担当。
+  想定ポジション（`ExpectedPositions`）の更新も同様で、**監視開始前に永続化から
+  復元しておくこと**（空のままだと drift 超過として検知される）。
+- **edgeX / Aster / dYdX の流動性指標**: ファンディングと同じく未対応。取れる DEX
+  から順に増やせばよく、取れない DEX の列は空欄のまま残る。
 - **execution / persistence / notifier**: フェーズ3 以降。
 
 ### 実 API と突き合わせて確認すべきこと
 
 この環境では外部への TLS 接続ができず（プロキシの証明書検証で弾かれる）、
-**実 API のレスポンス形式は未検証**。パーサはいずれも複数の形式を受け付けるように
+**実 API のレスポンス形式は未検証**。OI・出来高のフィールド名
+（Hyperliquid の `dayNtlVlm`、Lighter の `open_interest` /
+`daily_quote_token_volume`）と、各 DEX の最小注文単位も同様に要確認。パーサはいずれも複数の形式を受け付けるように
 してあるが、実データと差異があれば各 crate の固定サンプルとテストを更新すること。
 
 | 項目 | 場所 |

@@ -14,6 +14,7 @@
 //!  ├─ spawn: CSV writer タスク（バッファリングして定期 flush）
 //!  ├─ spawn: ファンディング収集タスク（対応 DEX のみ） ─→ mpsc<FundingRate>
 //!  ├─ spawn: ファンディング CSV writer タスク
+//!  ├─ spawn: ネットデルタ監視タスク（フェーズ3 で有効化。§net_delta）
 //!  ├─ spawn: 監視タスク（接続状態・レイテンシ異常）
 //!  └─ SIGINT/SIGTERM → CSV を flush して正常終了
 //! ```
@@ -23,11 +24,12 @@
 
 mod aggregator;
 mod monitor;
+mod net_delta;
 mod rate_limit;
 mod supervisor;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -40,11 +42,13 @@ use dex_hyperliquid::HyperliquidMarketData;
 use dex_lighter::LighterMarketData;
 use dex_traits::{FundingRateSource, MarketDataSource};
 use market_data::BookStore;
+use risk::KillSwitch;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::aggregator::{spawn_aggregator, AggregatorStats};
 use crate::monitor::spawn_monitor;
+use crate::net_delta::spawn_net_delta_monitoring;
 use crate::supervisor::{spawn_funding_source, spawn_supervised_source};
 
 const DEFAULT_CONFIG_PATH: &str = "config/collector.toml";
@@ -132,6 +136,16 @@ async fn main() -> Result<()> {
         None
     };
 
+    // --- ネットデルタ監視（実ポジション取得が要るためフェーズ1 では起動しない）---
+    // キルスイッチは監視タスクと発注側（フェーズ3）で共有する。
+    let kill_switch = Arc::new(Mutex::new(KillSwitch::new(cfg.killswitch.clone())));
+    let net_delta_handles = spawn_net_delta_monitoring(
+        &cfg,
+        Arc::clone(&store),
+        Arc::clone(&kill_switch),
+        shutdown_rx.clone(),
+    );
+
     // --- 集約 / 記録 / 監視タスク ---
     let csv_handle = recorder::spawn_csv_writer(&cfg.recording, snapshot_rx);
     let aggregator_handle = spawn_aggregator(
@@ -184,6 +198,9 @@ async fn main() -> Result<()> {
     }
 
     monitor_handle.abort();
+    for handle in net_delta_handles {
+        handle.abort();
+    }
     for handle in source_handles {
         handle.abort();
     }

@@ -251,6 +251,7 @@ dependencies = [
  "dex-traits",
  "market-data",
  "recorder",
+ "risk",
  "rust_decimal",
  "rust_decimal_macros",
  "serde_json",
@@ -1366,6 +1367,7 @@ dependencies = [
  "core-types",
  "csv",
  "market-data",
+ "risk",
  "rust_decimal",
  "rust_decimal_macros",
  "tempfile",
@@ -1467,12 +1469,15 @@ dependencies = [
 name = "risk"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "config",
  "core-types",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "strategy-traits",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 

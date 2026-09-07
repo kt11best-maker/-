@@ -211,12 +211,33 @@ pub struct MarketStatsEntry {
     pub funding_rate: Option<Decimal>,
     /// 次回精算時刻（ms epoch）。API が返す場合のみ。
     pub next_funding_time_ms: Option<u64>,
+    /// 未決済建玉（**契約数量**）。
+    pub open_interest: Option<Decimal>,
+    /// 直近 24 時間の取引量（**クオート = USD 建て**）。
+    pub daily_quote_volume: Option<Decimal>,
+    /// 直近 24 時間の取引量（**ベース = 契約数量建て**）。
+    ///
+    /// クオート建てが無い場合に、価格を掛けて USD 換算するために使う。
+    pub daily_base_volume: Option<Decimal>,
 }
 
 impl MarketStatsEntry {
     /// ファンディング関連のフィールドが 1 つでも入っているか。
     pub fn has_funding(&self) -> bool {
         self.current_funding_rate.is_some() || self.funding_rate.is_some()
+    }
+
+    /// 24 時間取引量を **USD 建て**で返す。
+    ///
+    /// クオート建てがあればそれをそのまま使い、無ければベース建て × 価格で
+    /// 換算する。**価格が無ければ換算しない**（推測で埋めない）。
+    pub fn volume_24h_usd(&self) -> Option<Decimal> {
+        if let Some(quote) = self.daily_quote_volume {
+            return Some(quote);
+        }
+        let base = self.daily_base_volume?;
+        let price = self.mark_price.or(self.index_price)?;
+        (price > Decimal::ZERO).then(|| base * price)
     }
 }
 
@@ -250,6 +271,21 @@ fn walk_market_stats(value: &serde_json::Value, depth: usize, out: &mut Vec<Mark
                         .get("next_funding_time")
                         .or_else(|| map.get("next_funding_timestamp"))
                         .and_then(as_u64),
+                    // 流動性指標もファンディングと同じメッセージに入っている。
+                    // キー名は実 API と突き合わせて確認すること（複数の綴りを
+                    // 受け付けるようにしてあるが、無ければ空欄のまま残す）。
+                    open_interest: map
+                        .get("open_interest")
+                        .or_else(|| map.get("open_interest_base"))
+                        .and_then(as_decimal),
+                    daily_quote_volume: map
+                        .get("daily_quote_token_volume")
+                        .or_else(|| map.get("daily_quote_volume"))
+                        .and_then(as_decimal),
+                    daily_base_volume: map
+                        .get("daily_base_token_volume")
+                        .or_else(|| map.get("daily_base_volume"))
+                        .and_then(as_decimal),
                 });
             }
             for v in map.values() {
@@ -410,6 +446,40 @@ mod tests {
         assert_eq!(e.current_funding_rate, Some(dec!(0.0000125)));
         assert_eq!(e.funding_rate, Some(dec!(0.0000130)));
         assert_eq!(e.next_funding_time_ms, Some(1700000003600));
+    }
+
+    #[test]
+    fn collects_liquidity_metrics_from_market_stats() {
+        // OI と出来高もファンディングと同じメッセージに入っている
+        let raw = r#"{"channel":"market_stats:0","market_stats":{
+            "symbol":"BTC","market_id":1,"mark_price":"36000.5",
+            "current_funding_rate":"0.0000125","open_interest":"1234.5",
+            "daily_quote_token_volume":"987654321.0",
+            "daily_base_token_volume":"27000.0"}}"#;
+        let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
+        let stats = collect_market_stats(&env.market_stats.unwrap());
+        let e = &stats[0];
+
+        assert_eq!(e.open_interest, Some(dec!(1234.5)));
+        // クオート建てがあればそのまま USD として使う
+        assert_eq!(e.volume_24h_usd(), Some(dec!(987654321.0)));
+    }
+
+    #[test]
+    fn base_volume_is_converted_with_price_only() {
+        let raw = r#"{"channel":"market_stats:0","market_stats":{
+            "symbol":"BTC","market_id":1,"mark_price":"36000",
+            "daily_base_token_volume":"10"}}"#;
+        let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
+        let e = &collect_market_stats(&env.market_stats.unwrap())[0];
+        assert_eq!(e.volume_24h_usd(), Some(dec!(360000)));
+
+        // 価格が無ければ換算しない（数量を USD として記録してしまわない）
+        let raw = r#"{"channel":"market_stats:0","market_stats":{
+            "symbol":"BTC","market_id":1,"daily_base_token_volume":"10"}}"#;
+        let env: LighterEnvelope = serde_json::from_str(raw).unwrap();
+        let e = &collect_market_stats(&env.market_stats.unwrap())[0];
+        assert_eq!(e.volume_24h_usd(), None);
     }
 
     #[test]

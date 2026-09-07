@@ -17,8 +17,9 @@
 //! 受信メッセージ（`activeAssetCtx`）:
 //! ```json
 //! {"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{
-//!   "funding":"0.0000125","openInterest":"...","oraclePx":"36000.0",
-//!   "markPx":"36000.5","midPx":"36000.4","premium":"0.0001"}}}
+//!   "funding":"0.0000125","openInterest":"...","dayNtlVlm":"...",
+//!   "oraclePx":"36000.0","markPx":"36000.5","midPx":"36000.4",
+//!   "premium":"0.0001"}}}
 //! ```
 //!
 //! `funding` が**1 回の精算あたり**のレート。精算間隔は API に含まれないため、
@@ -98,6 +99,9 @@ pub struct AssetCtx {
     pub mid_px: Option<Decimal>,
     #[serde(default, rename = "openInterest")]
     pub open_interest: Option<Decimal>,
+    /// 直近 24 時間の取引量（**USD 建て**のノーショナル）。
+    #[serde(default, rename = "dayNtlVlm")]
+    pub day_ntl_vlm: Option<Decimal>,
     /// マーク価格とオラクル価格の乖離率。フェーズ1 では未使用。
     #[serde(default)]
     pub premium: Option<Decimal>,
@@ -128,6 +132,10 @@ pub fn to_funding_rate(
         next_funding_time_ms: None,
         index_price: data.ctx.oracle_px.map(Price),
         mark_price: data.ctx.mark_px.map(Price),
+        // 流動性指標は同じ `activeAssetCtx` に入っているので相乗りさせる
+        // （**新しい接続も購読も増やさない**）。
+        open_interest: data.ctx.open_interest.map(Quantity),
+        volume_24h_usd: data.ctx.day_ntl_vlm,
         trace,
     })
 }
@@ -365,6 +373,7 @@ mod tests {
             "ctx": {
                 "funding": "0.0000125",
                 "openInterest": "1234.5",
+                "dayNtlVlm": "987654321.0",
                 "oraclePx": "36000.0",
                 "markPx": "36000.5",
                 "midPx": "36000.4",
@@ -389,6 +398,39 @@ mod tests {
         // 0.0000125 × 24 × 365 × 100 = 10.95%
         assert_eq!(rate.annualized_pct(), Some(dec!(10.9500)));
         assert!(rate.trace.normalize_latency().is_some());
+    }
+
+    #[test]
+    fn active_asset_ctx_carries_liquidity_metrics() {
+        // OI と出来高は同じメッセージに入っているので、購読を増やさずに取れる
+        let HlMessage::ActiveAssetCtx { data } = serde_json::from_str(ACTIVE_ASSET_CTX).unwrap()
+        else {
+            panic!()
+        };
+        let rate = to_funding_rate(&data, Some(dec!(1)), MessageTrace::on_receive()).unwrap();
+        let stats = rate.market_stats();
+
+        assert_eq!(stats.open_interest, Some(Quantity(dec!(1234.5))));
+        assert_eq!(stats.volume_24h_usd, Some(dec!(987654321.0)));
+        // OI は契約数量なので、比率はマーク価格でノーショナル換算してから割る
+        assert_eq!(
+            stats.open_interest_usd(),
+            Some(dec!(1234.5) * dec!(36000.5))
+        );
+        assert!(stats.volume_oi_ratio().unwrap() > Decimal::ZERO);
+    }
+
+    #[test]
+    fn ctx_without_liquidity_metrics_is_still_usable() {
+        // 指標が欠けていてもレートの記録は続ける（穴は空欄で残す）
+        let raw = r#"{"channel":"activeAssetCtx","data":{"coin":"BTC",
+            "ctx":{"funding":"0.0001","markPx":"36000.5"}}}"#;
+        let HlMessage::ActiveAssetCtx { data } = serde_json::from_str(raw).unwrap() else {
+            panic!()
+        };
+        let rate = to_funding_rate(&data, Some(dec!(1)), MessageTrace::on_receive()).unwrap();
+        assert!(!rate.market_stats().has_any());
+        assert_eq!(rate.market_stats().volume_oi_ratio(), None);
     }
 
     #[test]

@@ -469,6 +469,8 @@ mod tests {
             next_funding_time_ms: None,
             index_price: None,
             mark_price: None,
+            open_interest: None,
+            volume_24h_usd: None,
             trace: MessageTrace::on_receive(),
         }
     }

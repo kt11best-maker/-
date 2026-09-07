@@ -20,6 +20,7 @@ dex-hyperliquid.workspace = true
 dex-traits.workspace = true
 market-data.workspace = true
 recorder.workspace = true
+risk.workspace = true
 
 anyhow.workspace = true
 rust_decimal.workspace = true

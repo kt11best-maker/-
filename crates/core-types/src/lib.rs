@@ -9,6 +9,7 @@
 pub mod book;
 pub mod fees;
 pub mod funding;
+pub mod market_stats;
 pub mod num;
 pub mod symbol;
 pub mod trace;
@@ -16,6 +17,7 @@ pub mod trace;
 pub use book::{Level, OrderBook, Side};
 pub use fees::{DexFees, ExecutionStyle, FeeSchedule};
 pub use funding::{breakeven_intervals, FundingRate, FundingSpread};
+pub use market_stats::MarketStats;
 pub use num::{Price, Quantity, BPS_DENOMINATOR};
 pub use symbol::{Dex, ParseSymbolError, Symbol};
 pub use trace::MessageTrace;

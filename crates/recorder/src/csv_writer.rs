@@ -199,9 +199,9 @@ fn open_writer(path: &Path) -> Result<csv::Writer<BufWriter<File>>, CsvError> {
 /// 追記モードでファイルを開き、新規作成時だけヘッダを書く。
 ///
 /// 再起動しても同日のファイルを引き継ぐ。ファンディング CSV とも共有する。
-pub(crate) fn open_writer_with_header(
+pub(crate) fn open_writer_with_header<S: AsRef<str>>(
     path: &Path,
-    header: &[&str],
+    header: &[S],
 ) -> Result<csv::Writer<BufWriter<File>>, CsvError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -215,7 +215,7 @@ pub(crate) fn open_writer_with_header(
         .flexible(false)
         .from_writer(BufWriter::new(file));
     if is_new {
-        writer.write_record(header)?;
+        writer.write_record(header.iter().map(|h| h.as_ref()))?;
         writer.flush()?;
     }
     Ok(writer)

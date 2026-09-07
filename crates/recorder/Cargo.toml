@@ -9,6 +9,7 @@ license.workspace = true
 config.workspace = true
 core-types.workspace = true
 market-data.workspace = true
+risk.workspace = true
 
 chrono.workspace = true
 csv.workspace = true
